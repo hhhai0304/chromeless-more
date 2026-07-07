@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Lets WKWebView perform WebAuthn (passkeys via iCloud Keychain / Touch ID)
+       for any site. Apple grants this formally to registered browser vendors;
+       macOS honors it on a locally ad-hoc-signed build. -->
+  <key>com.apple.developer.web-browser.public-key-credential</key>
+  <true/>
+</dict>
+</plist>
