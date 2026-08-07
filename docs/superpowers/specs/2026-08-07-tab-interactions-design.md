@@ -19,8 +19,9 @@ open it in a background tab.
 | Cancel a drag | Esc reverts to the original order |
 | When does middle-click close fire | On mouse *up*, and only if the cursor is still inside the tab |
 | Middle-click on empty bar space | Opens a new tab |
-| Middle-click on a link | Opens a background tab; `⌘`-click too, `⌘⇧`-click stays foreground |
+| Middle-click on a link | Opens a background tab, via a page script — WebKit gives no native hook. `⌘`-click is unavailable: `⌘` belongs to window dragging |
 | Tab reordering and web views | Reordering only permutes the `tabs` array; no `WKWebView` is touched |
+| Window dragging while tabs are up | `window.isMovable = false`, with `performDrag` restoring it for `⌘`-drag and the empty strip |
 
 ## Prerequisite: `TabBarView.rebuild` must reuse its views
 
@@ -86,7 +87,7 @@ window?.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown],
 | --- | --- |
 | `.leftMouseDragged`, moved < 4pt from origin | Ignored. Below this threshold the gesture is still a click. |
 | `.leftMouseDragged`, past threshold | Mark the drag live. Raise the item above its siblings (`addSubview(item, positioned: .below, relativeTo: addButton)`). Set `item.frame.origin.x` to `cursorX - grabOffset`, clamped to the bar's tab region. |
-| Dragged item's centre passes a neighbour's centre | Swap the two entries in `items`, then animate every non-dragged item to its new slot over 0.12s via `animator().frame`. |
+| Dragged item's left edge crosses into another slot | Move the entry to that index in `items` (remove and reinsert, matching `moveTab`), then animate every non-dragged item to its new slot over 0.12s via `animator().frame`. |
 | `.keyDown` with keyCode 53 (Esc) | Restore the original `items` order, animate the dragged item home, stop the loop, report no reorder. |
 | `.leftMouseUp` | Animate the dragged item to its slot. If the final index differs from the starting index, call `onReorder?(from:to:)`. Stop the loop. |
 
@@ -117,6 +118,44 @@ the active tab is still the active tab, just at a different position.
 
 The `refreshTabs()` call is harmless now that `rebuild` reuses views: the items are already
 in their final order and at their final frames, so it repaints nothing visible.
+
+## The window-drag collision
+
+The tab bar occupies the window's titlebar strip, and macOS registers that strip as a
+window-drag region in the WindowServer, outside this process. A press on a tab therefore
+starts a window drag at the same moment it starts a tab drag. Both run; the window slides
+along with the cursor, and because the cursor keeps the same position *relative to the
+window*, the dragged tab never moves at all.
+
+This was found by running the app, not by reading code, and four plausible fixes were tried
+and measured before one worked:
+
+| Attempt | Result |
+| --- | --- |
+| `mouseDownCanMoveWindow = false` on `TabItemView` | No effect. The hit view was logged reporting `canMove=false` while the window moved anyway. |
+| `hitTest` returning the tab so the press never reaches the transparent title label | No effect. |
+| A `NSTextField` subclass returning `mouseDownCanMoveWindow = false`, so the label stops donating its own rect to the drag region | No effect. |
+| `isMovableByWindowBackground = false`, both at window creation and toggled for the duration of the gesture | No effect. Also proves the culprit is not background dragging. |
+| **`window.isMovable = false`** | **Works.** The window stays put and the tab tracks the cursor. |
+
+A control test isolated the cause: dragging in the page area never moved the window, and
+moving the tab bar 60pt down — out of the titlebar strip — made every fix unnecessary. The
+strip is the problem, and `isMovable` is the only switch the WindowServer honours.
+
+`isMovable` is therefore cleared exactly while the tab bar is up, in `refreshTabs`:
+
+```swift
+window?.isMovable = !tabBarVisible
+```
+
+Nothing is lost. `performDrag(with:)` still moves the window with `isMovable` false — this
+was measured, not assumed — so:
+
+- `⌘`-drag anywhere keeps working through the existing call in `BrowserWebView.mouseDown`.
+- The empty part of the tab bar moves the window through a new `performDrag` in
+  `TabBarView.mouseDown`, which is what browsers do anyway.
+- With a single tab there is no tab bar, `isMovable` stays true, and the titlebar strip
+  behaves exactly as it did before.
 
 ## Middle-click a tab to close it
 
@@ -155,52 +194,55 @@ hit-tested to the `TabItemView` and never reaches the bar.
 
 ## Middle-click a link for a background tab
 
-`createWebViewWith` (main.swift:1522) already opens a new tab for link and `window.open`
-navigations; it only lacks the notion of "background".
+The `createWebViewWith` route this section originally proposed does not work, and the two
+risks it flagged were both resolved by running the app. The results:
 
-```swift
-let shift = navigationAction.modifierFlags.contains(.shift)
-let background = !shift && (navigationAction.buttonNumber == 1
-                            || navigationAction.modifierFlags.contains(.command))
-return addTab(url: nil, configuration: configuration, activate: !background).webView
+**WebKit does not deliver a navigation action for a middle-click on a link.** It never
+calls `createWebViewWith`. It navigates the *current frame* instead — a middle-click on a
+link replaced the page in the active tab, which is worse than doing nothing. The fallback
+is therefore the implementation, not the contingency.
+
+**A background tab loads fine without a superview.** Opening one with `activate: false`
+leaves its web view outside the view hierarchy, and the page still loaded and reported its
+title into the tab bar. No change to `refreshTabs` was needed.
+
+### What ships
+
+A user script injected at document start in every frame cancels the middle-click and
+reports the href back:
+
+```js
+document.addEventListener("mousedown", swallow, true);   // suppress the navigation
+document.addEventListener("auxclick", function (e) {     // report on release
+  if (e.button !== 1) return;
+  var a = anchor(e.target);
+  if (!a) return;
+  e.preventDefault();
+  e.stopPropagation();
+  window.webkit.messageHandlers.chromelessAuxClick.postMessage(a.href);
+}, true);
 ```
 
-`addTab` already takes `activate:` and leaves `activeIndex` alone when it is false, so no
-signature change is needed. Tab titles also already update for inactive tabs — the
-`\.title` observation in `observe(_:)` (main.swift:1155) looks the tab up by identity and
-calls `tabBar.update(titleAt:to:)` regardless of which tab is active.
+Suppressing on `mousedown` and reporting on `auxclick` means the gesture only counts once
+the button is released, and `anchor()` walks up from the event target so a click on a child
+element of a link still finds the `<a>`.
 
-`⌘`-click becomes a background tab and `⌘⇧`-click a foreground one, matching Safari and
-Chrome. Today both open a foreground tab.
+`AuxClickRouter`, a single shared `WKScriptMessageHandler`, receives the message and routes
+it by `message.webView` — it never needs to know which window or profile the page belongs
+to. `BrowserWebView` gains an `onAuxClickLink` closure that `configure(_:)` points at
+`addTab(url:activate: false)`.
 
-### Two assumptions that must be verified by running the app, not by reasoning
+Tab titles already update for inactive tabs: the `\.title` observation in `observe(_:)`
+looks the tab up by identity and calls `tabBar.update(titleAt:to:)` regardless of which tab
+is active.
 
-**Does WebKit deliver a navigation action for a middle-click on a link?**
-`WKNavigationAction.buttonNumber` exists and reports `1` for the middle button, but it is
-not established that WebKit synthesises a link navigation from a middle-click inside a
-plain `WKWebView` rather than dispatching a bare `auxclick` to the page and stopping there.
-If `createWebViewWith` is never called, this feature does not work at all.
+### ⌘-click is not part of this
 
-Fallback if it is not called: inject a user script that listens for `auxclick` with
-`button === 1` on an anchor, calls `preventDefault()`, and posts the resolved `href` through
-a `WKScriptMessageHandler`. The repo has **no** script message handler infrastructure today
-— `makeWebConfiguration` only ever adds the WebAuthn-hiding script and never registers a
-handler — so the fallback means building that infrastructure, and is materially more work
-than the happy path.
-
-**Does a background tab load without a superview?**
-`refreshTabs()` only adds `activeTab.webView` to the container and removes every other
-tab's web view. A tab opened with `activate: false` therefore has a web view with no
-superview and no window when WebKit begins driving the load. This is expected to work —
-WebKit throttles rendering and timers for off-screen views but does not block loading — but
-it has to be confirmed with a real page.
-
-Fallback if the load stalls: add the background tab's web view to the container positioned
-below the active tab's, so it is in the hierarchy but fully covered, and let the next
-`refreshTabs()` pull it back out.
-
-Because both risks live in this one feature, it is sequenced **last** and kept separate, so
-a failure here cannot block the three interactions above it.
+`BrowserWebView.mouseDown` (main.swift:434) claims `⌘`-click for dragging the window and
+returns without calling `super`, so a `⌘`-click never reaches the page. Measured: it
+produces no navigation, no new tab, and no window movement. `⌘`-click therefore cannot open
+a background tab in this app, and `createWebViewWith` is left exactly as it was rather than
+carrying an unreachable `background` branch.
 
 ## Out of scope
 
@@ -210,21 +252,28 @@ a failure here cannot block the three interactions above it.
 
 ## Testing
 
-The app is an AppKit binary with no test target, so verification is manual, via `./build.sh`
-and running the app. Each item below must be observed, not assumed:
+The app is an AppKit binary with no test target, so verification is manual: `./build.sh`,
+run the app, and drive it with synthetic `CGEvent` mouse input while reading back the window
+frame and screenshots of the tab bar. The window frame matters as much as the tab order —
+the whole window-drag collision above is invisible if you only look at the tabs.
 
-1. Click a tab — it activates, no drag artefacts, no flicker in the bar.
-2. Drag a tab left and right past several neighbours — neighbours slide aside, the order
-   follows the cursor, releasing keeps the new order and the same tab stays active.
-3. Drag a tab and press Esc — order reverts, the tab animates home.
-4. Drag a tab far above, below, and outside the window — it stays clamped in the bar.
-5. Drag an inactive tab — it activates on press, then reorders.
-6. Middle-click a tab — it closes; the remaining tabs keep the right titles and the right
-   tab stays active.
-7. Middle-click a tab, slide off it, release — nothing closes.
-8. Middle-click a tab, close down to one tab, middle-click again — the window closes, same
-   as `⌘W` (`closeTab` already routes the last tab to `performClose`).
-9. Middle-click empty tab bar space — a new tab opens.
-10. Middle-click a link — a background tab opens, the current tab stays active, and the new
-    tab's title appears in the bar once the page loads.
-11. `⌘`-click a link — background tab. `⌘⇧`-click — foreground tab.
+Results, all observed rather than assumed:
+
+| # | Check | Result |
+| --- | --- | --- |
+| 1 | Click a tab — it activates | pass |
+| 2 | Drag a tab across several neighbours — they slide aside, order follows the cursor, the same tab stays active | pass |
+| 3 | The window does not move during a tab drag | pass — frame unchanged at every step |
+| 4 | Drag a tab and press Esc — order reverts | pass |
+| 5 | Middle-click a tab — it closes, the right tab stays active | pass |
+| 6 | Middle-click a tab, slide off, release — nothing closes | pass |
+| 7 | Middle-click empty tab bar space — a new tab opens | pass |
+| 8 | Drag empty tab bar space — the window moves | pass |
+| 9 | With one tab, drag the titlebar strip — the window moves as before | pass |
+| 10 | Middle-click a plain link — one background tab, current tab neither switched nor navigated | pass |
+| 11 | Middle-click a `target="_blank"` link — one background tab, not two | pass |
+| 12 | A background tab loads and reports its title into the bar | pass |
+| 13 | `⌘`-click a link | no effect — see above; `⌘` belongs to window dragging |
+
+Not reachable, so not tested: middle-clicking the last remaining tab. The bar hides at one
+tab, so there is nothing to click. `⌘W` still routes the last tab to `performClose`.

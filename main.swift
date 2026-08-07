@@ -418,6 +418,8 @@ final class BrowserWebView: WKWebView {
     // Bare Esc escapes back to the start page — unless fullscreen needs it,
     // or the ⌘L HUD is open (its field is first responder and handles Esc itself).
     var onEscape: (() -> Bool)?
+    // Set by the owning window controller; fed by `AuxClickRouter`.
+    var onAuxClickLink: ((URL) -> Void)?
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53, // Esc
@@ -476,6 +478,51 @@ final class ProfileChipView: NSVisualEffectView {
 
 // MARK: - Tabs
 
+// WebKit does not treat a middle-click on a link as a request for a new window
+// — it never calls `createWebViewWith` and just navigates the current frame,
+// which is worse than doing nothing. So the page has to be taught: cancel the
+// default action and hand the href back for a background tab.
+private let auxClickScript = """
+(function () {
+  function anchor(node) {
+    while (node && node.nodeType === 1) {
+      if (node.tagName === "A" && node.href) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function swallow(e) {
+    if (e.button === 1 && anchor(e.target)) e.preventDefault();
+  }
+  // The navigation is suppressed on the way down and the href reported on the
+  // way up, so the gesture only counts once the button is actually released.
+  document.addEventListener("mousedown", swallow, true);
+  document.addEventListener("auxclick", function (e) {
+    if (e.button !== 1) return;
+    var a = anchor(e.target);
+    if (!a) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.webkit.messageHandlers.chromelessAuxClick.postMessage(a.href);
+  }, true);
+})();
+"""
+
+// One shared handler for every web view: it routes by the message's own web
+// view, so it never needs to know which window or profile the page belongs to.
+final class AuxClickRouter: NSObject, WKScriptMessageHandler {
+    static let shared = AuxClickRouter()
+    static let messageName = "chromelessAuxClick"
+
+    func userContentController(_ controller: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard let webView = message.webView as? BrowserWebView,
+              let href = message.body as? String,
+              let url = URL(string: href) else { return }
+        webView.onAuxClickLink?(url)
+    }
+}
+
 func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration {
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = profileStore.websiteDataStore(for: profile)
@@ -483,6 +530,9 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     conf.mediaTypesRequiringUserActionForPlayback = []
     conf.allowsAirPlayForMediaPlayback = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
+    conf.userContentController.add(AuxClickRouter.shared, name: AuxClickRouter.messageName)
+    conf.userContentController.addUserScript(WKUserScript(
+        source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
     if !hasPasskeyEntitlement {
         let hideWebAuthn = WKUserScript(
             source: """
@@ -529,13 +579,20 @@ final class Tab {
 }
 
 final class TabItemView: NSView {
-    var onSelect: (() -> Void)?
-    var onClose: (() -> Void)?
+    // The callbacks hand back the view rather than an index, so TabBarView can
+    // read `index` at call time. Baking the index into the closure only worked
+    // while every item was thrown away and rebuilt after each change.
+    var onSelect: ((TabItemView) -> Void)?
+    var onClose: ((TabItemView) -> Void)?
+    var onDragBegin: ((TabItemView, NSEvent) -> Void)?
+
+    var index = 0
 
     private let label = NSTextField(labelWithString: "")
     private let closeButton = NSButton()
     private var hovering = false
     private var trackingAreaRef: NSTrackingArea?
+    private var middleDownInside = false
 
     var isActive = false { didSet { applyStyle(); needsLayout = true } }
     var title = "" {
@@ -572,7 +629,7 @@ final class TabItemView: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    @objc private func closeClicked() { onClose?() }
+    @objc private func closeClicked() { onClose?(self) }
 
     private func applyStyle() {
         layer?.backgroundColor = isActive
@@ -605,7 +662,39 @@ final class TabItemView: NSView {
         needsLayout = true
     }
 
-    override func mouseDown(with event: NSEvent) { onSelect?() }
+    // Claim the press before it reaches the title label, so the middle-click
+    // bounds check below is against the tab's own geometry. The close button is
+    // the one exception, since it needs its own tracking.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if !closeButton.isHidden, closeButton.frame.contains(local) { return closeButton }
+        return self
+    }
+
+    // Selecting on press is what every browser does, so it happens before the
+    // drag is even considered; the bar decides afterwards whether the gesture
+    // turns into a reorder.
+    override func mouseDown(with event: NSEvent) {
+        onSelect?(self)
+        onDragBegin?(self, event)
+    }
+
+    // Middle-click closes, but only on release and only if the cursor never
+    // left the tab — sliding off before letting go cancels, the way it does for
+    // every other destructive click on macOS.
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return super.otherMouseDown(with: event) }
+        middleDownInside = true
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2, middleDownInside else {
+            return super.otherMouseUp(with: event)
+        }
+        middleDownInside = false
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClose?(self) }
+    }
 
     override func layout() {
         super.layout()
@@ -626,10 +715,15 @@ final class TabBarView: NSVisualEffectView {
     var onSelect: ((Int) -> Void)?
     var onClose: ((Int) -> Void)?
     var onNewTab: (() -> Void)?
+    var onReorder: ((Int, Int) -> Void)?
 
     private var items: [TabItemView] = []
     private let addButton = NSButton()
     private var chipWidth: CGFloat = 0
+    // Set only while a drag is live. `layout()` leaves this item alone; without
+    // that, any layout pass mid-gesture snaps it back to its slot.
+    private var dragItem: TabItemView?
+    private var dragToken = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -653,16 +747,41 @@ final class TabBarView: NSVisualEffectView {
 
     @objc private func addClicked() { onNewTab?() }
 
+    // With the tab bar up, the window is `isMovable = false` (see `refreshTabs`),
+    // so the empty part of the strip has to move the window by hand. Presses on
+    // a tab never reach here — items are subviews and take their own events.
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
+    // Middle-clicking the strip itself opens a tab. Items are subviews, so a
+    // middle-click that lands on a tab is hit-tested there and never gets here.
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return super.otherMouseUp(with: event) }
+        onNewTab?()
+    }
+
+    // Items are reused across rebuilds rather than recreated. A drag holds on
+    // to the view it is moving, and selecting a tab rebuilds the bar, so tearing
+    // the views down would kill the gesture on its first frame.
     func rebuild(titles: [String], activeIndex: Int) {
-        for item in items { item.removeFromSuperview() }
-        items = titles.enumerated().map { index, title in
+        while items.count > titles.count {
+            let gone = items.removeLast()
+            if gone === dragItem { dragItem = nil }
+            gone.removeFromSuperview()
+        }
+        while items.count < titles.count {
             let item = TabItemView(frame: .zero)
-            item.title = title
-            item.isActive = index == activeIndex
-            item.onSelect = { [weak self] in self?.onSelect?(index) }
-            item.onClose = { [weak self] in self?.onClose?(index) }
+            item.onSelect = { [weak self] in self?.onSelect?($0.index) }
+            item.onClose = { [weak self] in self?.onClose?($0.index) }
+            item.onDragBegin = { [weak self] in self?.beginDrag($0, with: $1) }
             addSubview(item, positioned: .below, relativeTo: addButton)
-            return item
+            items.append(item)
+        }
+        for (index, item) in items.enumerated() {
+            item.index = index
+            item.title = titles[index]
+            item.isActive = index == activeIndex
         }
         needsLayout = true
     }
@@ -678,23 +797,114 @@ final class TabBarView: NSVisualEffectView {
         needsLayout = true
     }
 
+    // Slot geometry, shared by `layout()` and the drag loop so a dragged tab
+    // lands on exactly the position layout would have given it.
+    private var tabPitch: CGFloat {
+        let addW: CGFloat = 26
+        let available = max(0, bounds.width - Self.trafficLightInset - (chipWidth + 18) - addW - 8)
+        return min(190, max(90, available / CGFloat(max(1, items.count))))
+    }
+
+    private func slotFrame(_ index: Int) -> NSRect {
+        NSRect(x: Self.trafficLightInset + tabPitch * CGFloat(index), y: 3,
+               width: max(40, tabPitch - 3), height: bounds.height - 6)
+    }
+
     override func layout() {
         super.layout()
-        let b = bounds
-        let left = Self.trafficLightInset
+        for (index, item) in items.enumerated() where item !== dragItem {
+            item.frame = slotFrame(index)
+        }
         let addW: CGFloat = 26
         let rightReserve = chipWidth + 18
-        let available = max(0, b.width - left - rightReserve - addW - 8)
-        let count = max(1, items.count)
-        let tabW = min(190, max(90, available / CGFloat(count)))
+        let x = Self.trafficLightInset + tabPitch * CGFloat(items.count)
+        addButton.frame = NSRect(
+            x: min(x + 2, max(Self.trafficLightInset, bounds.width - rightReserve - addW)),
+            y: (bounds.height - 22) / 2, width: addW, height: 22)
+    }
 
-        var x = left
-        for item in items {
-            item.frame = NSRect(x: x, y: 3, width: max(40, tabW - 3), height: b.height - 6)
-            x += tabW
+    // MARK: Drag to reorder
+
+    private func settle(_ index: Int, of item: TabItemView) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            item.animator().frame = slotFrame(index)
         }
-        addButton.frame = NSRect(x: min(x + 2, max(left, b.width - rightReserve - addW)),
-                                 y: (b.height - 22) / 2, width: addW, height: 22)
+    }
+
+    private func beginDrag(_ item: TabItemView, with event: NSEvent) {
+        guard let window, items.count > 1 else { return }
+        dragToken += 1
+        let token = dragToken
+        let start = convert(event.locationInWindow, from: nil)
+        let grabOffset = start.x - item.frame.origin.x
+        let startIndex = items.firstIndex(of: item) ?? item.index
+        let originalOrder = items
+        var currentIndex = startIndex
+        var live = false
+        var cancelled = false
+
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown],
+                           timeout: .infinity, mode: .eventTracking) { event, stop in
+            guard let event else { stop.pointee = true; return }
+            switch event.type {
+            case .keyDown:
+                guard event.keyCode == 53 else { return } // Esc
+                cancelled = true
+                self.items = originalOrder
+                stop.pointee = true
+
+            case .leftMouseDragged:
+                let p = self.convert(event.locationInWindow, from: nil)
+                if !live {
+                    // Below this the gesture is still a click, not a drag.
+                    guard abs(p.x - start.x) >= 4 else { return }
+                    live = true
+                    self.dragItem = item
+                    self.addSubview(item, positioned: .below, relativeTo: self.addButton)
+                }
+                let pitch = self.tabPitch
+                let maxX = Self.trafficLightInset + pitch * CGFloat(self.items.count - 1)
+                item.frame.origin.x = min(max(p.x - grabOffset, Self.trafficLightInset), maxX)
+
+                let raw = Int(((item.frame.origin.x - Self.trafficLightInset) / pitch).rounded())
+                let target = min(max(raw, 0), self.items.count - 1)
+                guard target != currentIndex else { return }
+                self.items.remove(at: currentIndex)
+                self.items.insert(item, at: target)
+                currentIndex = target
+                for (index, other) in self.items.enumerated() where other !== item {
+                    self.settle(index, of: other)
+                }
+
+            case .leftMouseUp:
+                stop.pointee = true
+
+            default:
+                break
+            }
+        }
+
+        guard live else { return }
+        let finalIndex = cancelled ? startIndex : currentIndex
+        // `dragItem` stays set until the settle animation finishes, so the
+        // relayout that `onReorder` triggers does not yank the tab into place
+        // and cut the animation short.
+        settle(finalIndex, of: item)
+        // Keyed on the drag, not the view: starting a second drag on the same tab
+        // inside the settle window would otherwise clear `dragItem` underneath it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, self.dragToken == token else { return }
+            self.dragItem = nil
+            self.needsLayout = true
+        }
+        if cancelled {
+            for (index, other) in items.enumerated() where other !== item {
+                settle(index, of: other)
+            }
+        } else if finalIndex != startIndex {
+            onReorder?(startIndex, finalIndex)
+        }
     }
 }
 
@@ -801,6 +1011,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let wv = tab.webView
         wv.autoresizingMask = [.width, .height]
         wv.onEscape = { [weak self] in self?.escapeToStart() ?? false }
+        wv.onAuxClickLink = { [weak self] url in
+            _ = self?.addTab(url: url, activate: false)
+        }
         wv.navigationDelegate = self
         wv.uiDelegate = self
         wv.allowsBackForwardNavigationGestures = true
@@ -846,6 +1059,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         refreshTabs()
     }
 
+    // Reordering only permutes the array; no web view is created, destroyed, or
+    // reparented, so the page being viewed never notices.
+    func moveTab(from: Int, to: Int) {
+        guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
+        tabs.insert(tabs.remove(at: from), at: to)
+        // Keep whichever tab was active active, wherever it ended up.
+        if activeIndex == from {
+            activeIndex = to
+        } else if from < activeIndex, activeIndex <= to {
+            activeIndex -= 1
+        } else if to <= activeIndex, activeIndex < from {
+            activeIndex += 1
+        }
+        refreshTabs()
+    }
+
     private func refreshTabs() {
         guard let container = window?.contentView else { return }
         for tab in tabs where tab !== activeTab && tab.webView.superview != nil {
@@ -856,6 +1085,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
         tabBar.rebuild(titles: tabs.map(\.displayTitle), activeIndex: activeIndex)
         tabBar.isHidden = !tabBarVisible
+        // The tab bar sits in the titlebar strip, which the WindowServer claims
+        // as a window-drag region from outside this process. No view-level
+        // property gets it back — `mouseDownCanMoveWindow` is simply ignored
+        // there — so a press on a tab slides the window instead of the tab.
+        // Clearing `isMovable` is the one thing that stops it. `performDrag` is
+        // unaffected by the flag, so ⌘-drag and the empty strip still move the
+        // window; with a single tab there is no bar and the strip behaves as it
+        // always has.
+        window?.isMovable = !tabBarVisible
         // Lay out now rather than next frame, so a switch never paints one
         // frame of tabs still sitting at their old positions.
         tabBar.layoutSubtreeIfNeeded()
@@ -926,6 +1164,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         tabBar.onSelect = { [weak self] i in self?.selectTab(at: i) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onNewTab = { [weak self] in self?.addTab(url: nil) }
+        tabBar.onReorder = { [weak self] from, to in self?.moveTab(from: from, to: to) }
         tabBar.isHidden = true
         container.addSubview(tabBar)
 
@@ -1526,6 +1765,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
             return nil
         }
+        // Background opening is not decided here. A middle-click never reaches
+        // this method — the page script cancels it and reports the href instead
+        // — and ⌘-click never reaches the page at all, because `BrowserWebView`
+        // claims ⌘ for dragging the window.
         // Handing back a live web view lets WebKit drive the load itself, so
         // window.open + document.write popups work, not just plain links.
         return addTab(url: nil, configuration: configuration).webView
