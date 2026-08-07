@@ -701,7 +701,7 @@ final class TabBarView: NSVisualEffectView {
 // MARK: - Browser window
 
 final class BrowserWindowController: NSWindowController, NSWindowDelegate,
-    WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSTextFieldDelegate, NSMenuItemValidation {
+    WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate, NSMenuItemValidation {
 
     private(set) var tabs: [Tab] = []
     private(set) var activeIndex = 0
@@ -718,8 +718,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var keyMonitor: Any?
     private var snapJob: SnapJob?
     private var toastHide: DispatchWorkItem?
-    private var activeDownloads: Set<ObjectIdentifier> = []
-    private var cancelledDownloads: Set<ObjectIdentifier> = []
+    private let downloadsPanel = DownloadsPanelView()
+    private var downloadsPanelPinned = false
+    private var downloadsHide: DispatchWorkItem?
+    private var downloadsObservers: [NSObjectProtocol] = []
+    // ⌥ is read when the navigation is still an action, because a response
+    // download arrives a round trip later, by which time the key is released.
+    private var pendingDownloadWantsPanel = false
     var profileID: String { profile.id }
     var onClose: (() -> Void)?
 
@@ -987,6 +992,90 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
         profileBadge.addSubview(profileLabel)
         container.addSubview(profileBadge)
+
+        downloadsPanel.onClose = { [weak self] in self?.hideDownloadsPanel() }
+        container.addSubview(downloadsPanel)
+        observeDownloads()
+    }
+
+    // MARK: Downloads panel
+
+    private func observeDownloads() {
+        let center = NotificationCenter.default
+        downloadsObservers = [
+            center.addObserver(forName: .downloadsDidChange, object: nil, queue: .main) {
+                [weak self] _ in self?.downloadsChanged()
+            },
+            center.addObserver(forName: .downloadsMessage, object: nil, queue: .main) {
+                [weak self] note in
+                guard let self, self.window?.isKeyWindow == true,
+                      let text = note.userInfo?["text"] as? String else { return }
+                self.showToast(text)
+            },
+        ]
+    }
+
+    private func downloadsChanged() {
+        downloadsPanel.refresh()
+        layoutOverlays()
+        if downloadManager.hasActiveDownloads {
+            downloadsHide?.cancel()
+            downloadsHide = nil
+        } else if !downloadsPanel.isHidden && !downloadsPanelPinned {
+            scheduleDownloadsHide()
+        }
+    }
+
+    private func showDownloadsPanel(pinned: Bool) {
+        if pinned { downloadsPanelPinned = true }
+        downloadsHide?.cancel()
+        downloadsHide = nil
+        downloadsPanel.refresh()
+        layoutOverlays()
+        guard downloadsPanel.isHidden || downloadsPanel.alphaValue < 1 else { return }
+        downloadsPanel.isHidden = false
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            downloadsPanel.animator().alphaValue = 1
+        }
+    }
+
+    private func hideDownloadsPanel() {
+        downloadsPanelPinned = false
+        downloadsHide?.cancel()
+        downloadsHide = nil
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            self.downloadsPanel.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self, self.downloadsPanel.alphaValue == 0 else { return }
+            self.downloadsPanel.isHidden = true
+        }
+    }
+
+    // Linger for a moment after the last transfer lands, and keep lingering
+    // while the pointer is still in the panel reaching for Reveal.
+    private func scheduleDownloadsHide() {
+        downloadsHide?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.downloadsPanelPinned,
+                  !downloadManager.hasActiveDownloads else { return }
+            if self.downloadsPanel.pointerInside {
+                self.scheduleDownloadsHide()
+                return
+            }
+            self.hideDownloadsPanel()
+        }
+        downloadsHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+
+    @objc func toggleDownloadsPanel(_ sender: Any?) {
+        if downloadsPanel.isHidden || downloadsPanel.alphaValue < 1 {
+            showDownloadsPanel(pinned: true)
+        } else {
+            hideDownloadsPanel()
+        }
     }
 
     private func layoutOverlays() {
@@ -1010,6 +1099,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let th: CGFloat = 34
         toastView.frame = NSRect(x: (b.width - tw) / 2, y: 28, width: tw, height: th)
         toastLabel.frame = NSRect(x: 16, y: (th - ts.height) / 2, width: ts.width, height: ts.height)
+
+        // Bottom-right, and never taller than the window leaves room for.
+        let dlW = min(DownloadsPanelView.width, max(240, b.width - 40))
+        let dlH = min(downloadsPanel.preferredHeight, max(120, b.height - barH - 40))
+        downloadsPanel.frame = NSRect(x: b.width - dlW - 20, y: 20, width: dlW, height: dlH)
 
         let profileMaxW = min(180, max(90, b.width * 0.34))
         let profileTextW = min(profileMaxW - 22, profileLabel.intrinsicContentSize.width)
@@ -1314,6 +1408,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
         mouseMonitor = nil
         keyMonitor = nil
+        downloadsHide?.cancel()
+        downloadsHide = nil
+        for observer in downloadsObservers { NotificationCenter.default.removeObserver(observer) }
+        downloadsObservers.removeAll()
+        // Downloads outlive their window on purpose: the manager holds the
+        // delegate, so tearing down these tabs does not stop a transfer.
         for tab in tabs { tab.teardown() }
         onClose?()
     }
@@ -1379,9 +1479,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
         if navigationAction.shouldPerformDownload {
             if launchOptions.snap != nil { exitForSnapDownload() }
+            pendingDownloadWantsPanel = navigationAction.modifierFlags.contains(.option)
             decisionHandler(.download)
             return
         }
+        // Remember the modifier even for links that only turn out to be
+        // downloads once the response headers arrive.
+        pendingDownloadWantsPanel = navigationAction.modifierFlags.contains(.option)
         decisionHandler(.allow)
     }
 
@@ -1398,72 +1502,19 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        beginDownload(download)
+        beginDownload(download, from: webView)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        beginDownload(download)
+        beginDownload(download, from: webView)
     }
 
-    private func beginDownload(_ download: WKDownload) {
+    private func beginDownload(_ download: WKDownload, from webView: WKWebView) {
         if launchOptions.snap != nil { exitForSnapDownload() }
-        download.delegate = self
-        activeDownloads.insert(ObjectIdentifier(download))
-        showToast("Choose download location")
-    }
-
-    // MARK: WKDownloadDelegate
-
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
-                  suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
-        let name = [suggestedFilename, response.suggestedFilename ?? "", response.url?.lastPathComponent ?? ""]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty } ?? "download"
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = name
-        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-        panel.canCreateDirectories = true
-
-        let id = ObjectIdentifier(download)
-        let finish: (NSApplication.ModalResponse) -> Void = { [weak self] result in
-            guard let self else {
-                completionHandler(nil)
-                return
-            }
-            if result == .OK, let url = panel.url {
-                self.showToast("Download started")
-                completionHandler(url)
-            } else {
-                self.activeDownloads.remove(id)
-                self.cancelledDownloads.insert(id)
-                self.showToast("Download cancelled")
-                completionHandler(nil)
-            }
-        }
-
-        if let window {
-            panel.beginSheetModal(for: window, completionHandler: finish)
-        } else {
-            panel.begin(completionHandler: finish)
-        }
-    }
-
-    func downloadDidFinish(_ download: WKDownload) {
-        activeDownloads.remove(ObjectIdentifier(download))
-        showToast("Download complete")
-    }
-
-    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        let id = ObjectIdentifier(download)
-        activeDownloads.remove(id)
-        if cancelledDownloads.remove(id) != nil { return }
-
-        let e = error as NSError
-        if e.code == NSURLErrorCancelled {
-            showToast("Download cancelled")
-        } else {
-            showToast("Download failed")
-        }
+        let wantsPanel = pendingDownloadWantsPanel
+        pendingDownloadWantsPanel = false
+        downloadManager.attach(download, from: webView, wantsSavePanel: wantsPanel)
+        if !wantsPanel { showDownloadsPanel(pinned: false) }
     }
 
     // MARK: WKUIDelegate
@@ -1560,6 +1611,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc func newWindow(_ sender: Any?) { presentProfilePicker(from: nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // Closing the last window quits the app, so without this a download that is
+    // 90% done dies silently when you close the window it started from.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard downloadManager.hasActiveDownloads, launchOptions.snap == nil else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "A download is still in progress."
+        alert.informativeText = "Quitting now cancels it."
+        alert.addButton(withTitle: "Quit Anyway")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            downloadManager.cancelAll()
+            return .terminateNow
+        }
+        return .terminateCancel
+    }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -1797,6 +1864,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                          action: #selector(BrowserWindowController.zoomOutPage(_:)), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Actual Size",
                          action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
+        viewMenu.addItem(.separator())
+        let downloads = viewMenu.addItem(
+            withTitle: "Show Downloads",
+            action: #selector(BrowserWindowController.toggleDownloadsPanel(_:)), keyEquivalent: "j")
+        downloads.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         let fullScreen = viewMenu.addItem(withTitle: "Enter Full Screen",
                                           action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")

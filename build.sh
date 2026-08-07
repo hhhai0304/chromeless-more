@@ -18,7 +18,7 @@ echo "▸ compiling ($ARCH)"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 \
   -target "$ARCH-apple-macos13.0" \
-  main.swift \
+  main.swift Downloads.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
   -framework Cocoa -framework WebKit
 
