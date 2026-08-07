@@ -10,6 +10,7 @@
 //   ⌘[ ⌘]  back / forward        ⌃⌘F  fullscreen
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //   ⌘T  new tab                  ⌃Tab  next tab
+//   ⌘click  link → background tab   ⇧⌘click  → foreground tab
 //
 // CLI screenshot mode:
 //   chromeless https://example.com --snap out.png --size 1440x900 --wait 2
@@ -400,6 +401,7 @@ let startPageHTML = """
     <div class="k"><kbd>&#8984; T</kbd></div>       <div>new tab &mdash; the tab bar shows up from the second one</div>
     <div class="k"><kbd>&#8963;&#8677;</kbd></div>  <div>next tab &mdash; <kbd>&#8984;1</kbd>&hellip;<kbd>&#8984;9</kbd> jump straight there</div>
     <div class="k"><kbd>&#8984; drag</kbd></div>    <div>move the window</div>
+    <div class="k"><kbd>&#8984; click</kbd></div>   <div>open a link in a background tab &mdash; middle-click too, <kbd>&#8679;&#8984;</kbd> to jump there</div>
     <div class="k"><kbd>&#8963;&#8984; F</kbd></div><div>fullscreen</div>
     <div class="k"><kbd>&#8679;&#8984; S</kbd></div><div>snapshot the page &rarr; desktop</div>
     <div class="k"><kbd>&#8984; P</kbd></div>       <div>pin on top of every window</div>
@@ -418,8 +420,9 @@ final class BrowserWebView: WKWebView {
     // Bare Esc escapes back to the start page — unless fullscreen needs it,
     // or the ⌘L HUD is open (its field is first responder and handles Esc itself).
     var onEscape: (() -> Bool)?
-    // Set by the owning window controller; fed by `AuxClickRouter`.
-    var onAuxClickLink: ((URL) -> Void)?
+    // Set by the owning window controller. Fed by `AuxClickRouter` for a
+    // middle-click, and by `openLinkInNewTab` for a ⌘-click.
+    var onOpenLinkInNewTab: ((URL, _ background: Bool) -> Void)?
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53, // Esc
@@ -432,13 +435,62 @@ final class BrowserWebView: WKWebView {
         super.keyDown(with: event)
     }
 
-    // ⌘-drag anywhere moves the window; mouse buttons 4/5 go back/forward.
+    // ⌘ is overloaded: ⌘-drag moves the window, ⌘-click opens the link under
+    // the cursor in a new tab. Which one it is is not knowable at mouse-down,
+    // so the press is held until the pointer either moves or comes back up.
+    // Mouse buttons 4/5 go back/forward.
     override func mouseDown(with event: NSEvent) {
-        if event.modifierFlags.contains(.command) {
-            window?.performDrag(with: event)
+        guard event.modifierFlags.contains(.command) else {
+            super.mouseDown(with: event)
             return
         }
-        super.mouseDown(with: event)
+        let start = event.locationInWindow
+        var dragged = false
+        window?.trackEvents(matching: [.leftMouseDragged, .leftMouseUp],
+                            timeout: .infinity, mode: .eventTracking) { moved, stop in
+            guard let moved else { stop.pointee = true; return }
+            if moved.type == .leftMouseDragged {
+                let p = moved.locationInWindow
+                // Same 4pt slop the tab drag uses, so a shaky hand still clicks.
+                guard hypot(p.x - start.x, p.y - start.y) >= 4 else { return }
+                dragged = true
+            }
+            stop.pointee = true
+        }
+        if dragged {
+            window?.performDrag(with: event)
+        } else {
+            openLinkInNewTab(at: convert(start, from: nil),
+                             background: !event.modifierFlags.contains(.shift))
+        }
+    }
+
+    // The page never sees this click — it was swallowed above — so the link has
+    // to be found by asking the document what sits at that point. Only the main
+    // frame is searched; a ⌘-click inside an iframe finds nothing. Middle-click
+    // has no such limit, since it is handled by a script injected into every
+    // frame.
+    private func openLinkInNewTab(at point: NSPoint, background: Bool) {
+        // elementFromPoint wants CSS pixels down from the top-left of the
+        // viewport. WKWebView is flipped, so the converted point already counts
+        // downwards; only the zoom has to be divided out.
+        let scale = pageZoom * magnification
+        guard scale > 0, isFlipped else { return }
+        let x = point.x / scale
+        let y = point.y / scale
+        evaluateJavaScript("""
+        (function () {
+          var n = document.elementFromPoint(\(x), \(y));
+          while (n && n.nodeType === 1) {
+            if (n.tagName === "A" && n.href) return n.href;
+            n = n.parentNode;
+          }
+          return null;
+        })();
+        """) { [weak self] result, _ in
+            guard let href = result as? String, let url = URL(string: href) else { return }
+            self?.onOpenLinkInNewTab?(url, background)
+        }
     }
     override func otherMouseUp(with event: NSEvent) {
         if event.buttonNumber == 3, canGoBack { goBack(); return }
@@ -519,7 +571,7 @@ final class AuxClickRouter: NSObject, WKScriptMessageHandler {
         guard let webView = message.webView as? BrowserWebView,
               let href = message.body as? String,
               let url = URL(string: href) else { return }
-        webView.onAuxClickLink?(url)
+        webView.onOpenLinkInNewTab?(url, true)
     }
 }
 
@@ -1011,8 +1063,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let wv = tab.webView
         wv.autoresizingMask = [.width, .height]
         wv.onEscape = { [weak self] in self?.escapeToStart() ?? false }
-        wv.onAuxClickLink = { [weak self] url in
-            _ = self?.addTab(url: url, activate: false)
+        wv.onOpenLinkInNewTab = { [weak self] url, background in
+            _ = self?.addTab(url: url, activate: !background)
         }
         wv.navigationDelegate = self
         wv.uiDelegate = self

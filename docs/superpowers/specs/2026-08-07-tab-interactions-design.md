@@ -19,7 +19,8 @@ open it in a background tab.
 | Cancel a drag | Esc reverts to the original order |
 | When does middle-click close fire | On mouse *up*, and only if the cursor is still inside the tab |
 | Middle-click on empty bar space | Opens a new tab |
-| Middle-click on a link | Opens a background tab, via a page script — WebKit gives no native hook. `⌘`-click is unavailable: `⌘` belongs to window dragging |
+| Middle-click on a link | Opens a background tab, via a page script — WebKit gives no native hook |
+| `⌘`-click on a link | Opens a background tab; `⇧⌘`-click opens it in the foreground. `⌘`-drag still moves the window — the two are told apart by whether the pointer moves |
 | Tab reordering and web views | Reordering only permutes the `tabs` array; no `WKWebView` is touched |
 | Window dragging while tabs are up | `window.isMovable = false`, with `performDrag` restoring it for `⌘`-drag and the empty strip |
 
@@ -236,13 +237,44 @@ Tab titles already update for inactive tabs: the `\.title` observation in `obser
 looks the tab up by identity and calls `tabBar.update(titleAt:to:)` regardless of which tab
 is active.
 
-### ⌘-click is not part of this
+### ⌘-click, added afterwards
 
-`BrowserWebView.mouseDown` (main.swift:434) claims `⌘`-click for dragging the window and
-returns without calling `super`, so a `⌘`-click never reaches the page. Measured: it
-produces no navigation, no new tab, and no window movement. `⌘`-click therefore cannot open
-a background tab in this app, and `createWebViewWith` is left exactly as it was rather than
-carrying an unreachable `background` branch.
+The first cut left `⌘`-click out, because `BrowserWebView.mouseDown` claimed `⌘` for
+dragging the window and returned without calling `super`, so the click never reached the
+page. Using the browser made the gap obvious enough to close.
+
+`⌘` is now disambiguated by waiting instead of by guessing. On a `⌘`-mouse-down the press
+is held in a tracking loop until the pointer either moves past 4pt — the same slop the tab
+drag uses — or comes back up:
+
+- moved → `performDrag(with:)` with the original event, and the window drag proceeds as
+  before. Calling `performDrag` after the loop has already consumed a few drag events was
+  verified to work.
+- released without moving → a `⌘`-click. `⇧` decides foreground versus background.
+
+Because the page never sees the click, the link cannot come from the DOM event. The href is
+resolved by asking the document what sits at that point:
+
+```swift
+document.elementFromPoint(x, y)   // then walk up to the nearest <a href>
+```
+
+`elementFromPoint` takes CSS pixels down from the top-left of the viewport. WKWebView is
+flipped, so the converted point already counts downwards and only `pageZoom * magnification`
+has to be divided out — an initial version flipped the y axis a second time and queried the
+wrong end of the page.
+
+Both entry points now share one closure on `BrowserWebView`:
+
+```swift
+var onOpenLinkInNewTab: ((URL, _ background: Bool) -> Void)?
+```
+
+`AuxClickRouter` calls it with `background: true`; the `⌘`-click path passes `!shift`.
+
+**Limitation:** `evaluateJavaScript` runs in the main frame, so a `⌘`-click on a link inside
+an iframe finds nothing. Middle-click has no such limit — its script is injected into every
+frame.
 
 ## Out of scope
 
@@ -273,7 +305,16 @@ Results, all observed rather than assumed:
 | 10 | Middle-click a plain link — one background tab, current tab neither switched nor navigated | pass |
 | 11 | Middle-click a `target="_blank"` link — one background tab, not two | pass |
 | 12 | A background tab loads and reports its title into the bar | pass |
-| 13 | `⌘`-click a link | no effect — see above; `⌘` belongs to window dragging |
+| 13 | `⌘`-click a link — one background tab, current tab neither switched nor navigated | pass |
+| 14 | `⇧⌘`-click a link — one tab, switched to it | pass |
+| 15 | `⌘`-drag still moves the window | pass |
+| 16 | `⌘`-click somewhere with no link — nothing happens, window does not jump | pass |
+| 17 | Plain click on a link still navigates in place | pass |
+
+A harness note worth keeping: synthetic `CGEvent`s inherit the current modifier state, so a
+run that sets `.maskCommand` and never clears it makes the *next* plain click arrive as a
+`⌘`-click. That produced a convincing false regression — "plain clicks open background tabs"
+— that was entirely the test driver. Set the flags explicitly on every posted event.
 
 Not reachable, so not tested: middle-clicking the last remaining tab. The bar hides at one
 tab, so there is nothing to click. `⌘W` still routes the last tab to `performClose`.
