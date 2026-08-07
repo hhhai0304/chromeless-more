@@ -1,8 +1,8 @@
 # chromeless
 
-**The browser that isn't there.** The window *is* the webpage — no tabs, no toolbar, no address bar, no chrome at all. Made for clean screenshots, fullscreen YouTube, dashboards, and anything else that deserves the whole window.
+**The browser that isn't there.** The window *is* the webpage — no toolbar, no address bar, and no tab bar until you ask for a second tab. Made for clean screenshots, fullscreen YouTube, dashboards, and anything else that deserves the whole window.
 
-A native macOS app in one Swift file, built on WKWebView (the Safari engine). No Electron, no dependencies, ~560 KB built.
+A native macOS app in one Swift file, built on WKWebView (the Safari engine). No Electron, no dependencies, ~630 KB built.
 
 ![chromeless start page](docs/chromeless.png)
 
@@ -34,10 +34,20 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) |
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
-| `⌘N` / `⌘W` | New profile window / close window |
+| `⌘T` | New tab |
+| `⌘W` / `⇧⌘W` | Close tab / close the whole window |
+| `⌘1`…`⌘8` `⌘9` | Jump to the nth tab / the last tab |
+| `⌃Tab` / `⌃⇧Tab` | Next / previous tab (`⇧⌘]` `⇧⌘[` too) |
+| `⌘N` | New profile window |
 
-The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small badge in the top-right corner. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
+The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
 Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
+
+## Tabs
+
+A window starts with one tab and no tab bar, so nothing changes until you press `⌘T`. From the second tab onward a thin bar appears at the top edge; close back down to one tab and it disappears again. Snapshots (`⇧⌘S`) capture the page only, so the bar never lands in a screenshot.
+
+Every tab in a window shares that window's profile and its cookies. To run two accounts side by side, open a second window with `⌘N` instead. Links with `target="_blank"` and `window.open` popups open as tabs rather than taking over the page. Tabs are not saved between launches.
 
 ## Profiles
 

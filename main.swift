@@ -1,13 +1,15 @@
 // chromeless — the browser that isn't there.
 //
-// A single-file macOS browser with zero chrome: no tabs, no toolbar, no
-// address bar — just the page, in a bare rounded window. Built on WKWebView
-// (the Safari engine). Made for clean screenshots and fullscreen video.
+// A single-file macOS browser with almost no chrome: no toolbar, no address
+// bar, and no tab bar until you open a second tab — just the page, in a bare
+// rounded window. Built on WKWebView (the Safari engine). Made for clean
+// screenshots and fullscreen video.
 //
 //   ⌘L  search / open url        ⇧⌘S  snapshot page → Desktop
 //   ⌘R  reload                   ⌘P   pin window on top
 //   ⌘[ ⌘]  back / forward        ⌃⌘F  fullscreen
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
+//   ⌘T  new tab                  ⌃Tab  next tab
 //
 // CLI screenshot mode:
 //   chromeless https://example.com --snap out.png --size 1440x900 --wait 2
@@ -395,6 +397,8 @@ let startPageHTML = """
   <p class="tag">the browser that isn&rsquo;t there</p>
   <div class="keys">
     <div class="k"><kbd>&#8984; L</kbd></div>       <div>search or enter a url</div>
+    <div class="k"><kbd>&#8984; T</kbd></div>       <div>new tab &mdash; the tab bar shows up from the second one</div>
+    <div class="k"><kbd>&#8963;&#8677;</kbd></div>  <div>next tab &mdash; <kbd>&#8984;1</kbd>&hellip;<kbd>&#8984;9</kbd> jump straight there</div>
     <div class="k"><kbd>&#8984; drag</kbd></div>    <div>move the window</div>
     <div class="k"><kbd>&#8963;&#8984; F</kbd></div><div>fullscreen</div>
     <div class="k"><kbd>&#8679;&#8984; S</kbd></div><div>snapshot the page &rarr; desktop</div>
@@ -404,7 +408,7 @@ let startPageHTML = """
     <div class="k"><kbd>&#8984; =</kbd> <kbd>&#8984; &minus;</kbd> <kbd>&#8984; 0</kbd></div><div>zoom</div>
     <div class="k"><kbd>&#8679;&#8984; C</kbd></div><div>copy current url</div>
   </div>
-  <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close</footer>
+  <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window</footer>
 </main></body></html>
 """
 
@@ -449,8 +453,249 @@ final class LayoutReportingView: NSView {
     }
 }
 
-final class PassthroughVisualEffectView: NSVisualEffectView {
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+// The profile chip. It used to pass clicks through to the page; now it is a
+// button that opens the profile picker, so it takes its own clicks.
+final class ProfileChipView: NSVisualEffectView {
+    var onClick: (() -> Void)?
+    private var trackingAreaRef: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = trackingAreaRef { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: bounds,
+                               options: [.mouseEnteredAndExited, .activeInKeyWindow],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t)
+        trackingAreaRef = t
+    }
+
+    override func mouseEntered(with event: NSEvent) { animator().alphaValue = 1.0 }
+    override func mouseExited(with event: NSEvent) { animator().alphaValue = 0.82 }
+    override func mouseDown(with event: NSEvent) { onClick?() }
+}
+
+// MARK: - Tabs
+
+func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration {
+    let conf = WKWebViewConfiguration()
+    conf.websiteDataStore = profileStore.websiteDataStore(for: profile)
+    conf.preferences.isElementFullscreenEnabled = true
+    conf.mediaTypesRequiringUserActionForPlayback = []
+    conf.allowsAirPlayForMediaPlayback = true
+    conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
+    if !hasPasskeyEntitlement {
+        let hideWebAuthn = WKUserScript(
+            source: """
+            (function () {
+              try {
+                delete window.PublicKeyCredential;
+                delete window.AuthenticatorResponse;
+                delete window.AuthenticatorAttestationResponse;
+                delete window.AuthenticatorAssertionResponse;
+              } catch (e) {}
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false)
+        conf.userContentController.addUserScript(hideWebAuthn)
+    }
+    return conf
+}
+
+// One tab: a web view plus the page state that used to live on the window
+// controller back when a window held exactly one page.
+final class Tab {
+    let webView: BrowserWebView
+    var onStartPage = false
+    var lastProgress: CGFloat = 0
+    var observations: [NSKeyValueObservation] = []
+
+    init(webView: BrowserWebView) { self.webView = webView }
+
+    var displayTitle: String {
+        if onStartPage { return "chromeless" }
+        let t = webView.title ?? ""
+        if !t.isEmpty { return t }
+        return webView.url?.host ?? "New Tab"
+    }
+
+    func teardown() {
+        observations.removeAll()
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        webView.removeFromSuperview()
+    }
+}
+
+final class TabItemView: NSView {
+    var onSelect: (() -> Void)?
+    var onClose: (() -> Void)?
+
+    private let label = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
+    private var hovering = false
+    private var trackingAreaRef: NSTrackingArea?
+
+    var isActive = false { didSet { applyStyle(); needsLayout = true } }
+    var title = "" {
+        didSet {
+            label.stringValue = title
+            toolTip = title
+            needsLayout = true
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.cornerRadius = 7
+        layer?.cornerCurve = .continuous
+
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        label.lineBreakMode = .byTruncatingTail
+        label.cell?.truncatesLastVisibleLine = true
+        addSubview(label)
+
+        closeButton.isBordered = false
+        closeButton.bezelStyle = .inline
+        closeButton.title = "✕"
+        closeButton.font = .systemFont(ofSize: 9, weight: .bold)
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+        closeButton.isHidden = true
+        addSubview(closeButton)
+
+        applyStyle()
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func closeClicked() { onClose?() }
+
+    private func applyStyle() {
+        layer?.backgroundColor = isActive
+            ? NSColor.white.withAlphaComponent(0.14).cgColor
+            : (hovering ? NSColor.white.withAlphaComponent(0.07).cgColor : NSColor.clear.cgColor)
+        label.textColor = isActive ? .labelColor : .secondaryLabelColor
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = trackingAreaRef { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: bounds,
+                               options: [.mouseEnteredAndExited, .activeInKeyWindow],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t)
+        trackingAreaRef = t
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        hovering = true
+        closeButton.isHidden = false
+        applyStyle()
+        needsLayout = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hovering = false
+        closeButton.isHidden = true
+        applyStyle()
+        needsLayout = true
+    }
+
+    override func mouseDown(with event: NSEvent) { onSelect?() }
+
+    override func layout() {
+        super.layout()
+        let b = bounds
+        closeButton.frame = NSRect(x: b.width - 20, y: (b.height - 16) / 2, width: 16, height: 16)
+        let labelRight: CGFloat = closeButton.isHidden ? 8 : 22
+        label.frame = NSRect(x: 9, y: (b.height - 15) / 2,
+                             width: max(0, b.width - 9 - labelRight), height: 15)
+    }
+}
+
+final class TabBarView: NSVisualEffectView {
+    static let height: CGFloat = 34
+    // The traffic lights are hidden but appear on hover over the top-left
+    // corner. Without this inset they would draw on top of the first tab.
+    static let trafficLightInset: CGFloat = 78
+
+    var onSelect: ((Int) -> Void)?
+    var onClose: ((Int) -> Void)?
+    var onNewTab: (() -> Void)?
+
+    private var items: [TabItemView] = []
+    private let addButton = NSButton()
+    private var chipWidth: CGFloat = 0
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        material = .hudWindow
+        blendingMode = .withinWindow
+        state = .active
+        wantsLayer = true
+
+        addButton.isBordered = false
+        addButton.bezelStyle = .inline
+        addButton.title = "+"
+        addButton.font = .systemFont(ofSize: 16, weight: .medium)
+        addButton.contentTintColor = .secondaryLabelColor
+        addButton.toolTip = "New Tab (⌘T)"
+        addButton.target = self
+        addButton.action = #selector(addClicked)
+        addSubview(addButton)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func addClicked() { onNewTab?() }
+
+    func rebuild(titles: [String], activeIndex: Int) {
+        for item in items { item.removeFromSuperview() }
+        items = titles.enumerated().map { index, title in
+            let item = TabItemView(frame: .zero)
+            item.title = title
+            item.isActive = index == activeIndex
+            item.onSelect = { [weak self] in self?.onSelect?(index) }
+            item.onClose = { [weak self] in self?.onClose?(index) }
+            addSubview(item, positioned: .below, relativeTo: addButton)
+            return item
+        }
+        needsLayout = true
+    }
+
+    func update(titleAt index: Int?, to title: String) {
+        guard let index, items.indices.contains(index) else { return }
+        items[index].title = title
+    }
+
+    func setChipWidth(_ width: CGFloat) {
+        guard width != chipWidth else { return }
+        chipWidth = width
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let b = bounds
+        let left = Self.trafficLightInset
+        let addW: CGFloat = 26
+        let rightReserve = chipWidth + 18
+        let available = max(0, b.width - left - rightReserve - addW - 8)
+        let count = max(1, items.count)
+        let tabW = min(190, max(90, available / CGFloat(count)))
+
+        var x = left
+        for item in items {
+            item.frame = NSRect(x: x, y: 3, width: max(40, tabW - 3), height: b.height - 6)
+            x += tabW
+        }
+        addButton.frame = NSRect(x: min(x + 2, max(left, b.width - rightReserve - addW)),
+                                 y: (b.height - 22) / 2, width: addW, height: 22)
+    }
 }
 
 // MARK: - Browser window
@@ -458,51 +703,38 @@ final class PassthroughVisualEffectView: NSVisualEffectView {
 final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSTextFieldDelegate, NSMenuItemValidation {
 
-    let webView: BrowserWebView
+    private(set) var tabs: [Tab] = []
+    private(set) var activeIndex = 0
     private let profile: BrowserProfile
+    private let tabBar = TabBarView()
     private let progressBar = NSView()
     private let hud = NSVisualEffectView()
     private let hudField = NSTextField()
     private let toastView = NSVisualEffectView()
     private let toastLabel = NSTextField(labelWithString: "")
-    private let profileBadge = PassthroughVisualEffectView()
+    private let profileBadge = ProfileChipView()
     private let profileLabel = NSTextField(labelWithString: "")
-    private var observations: [NSKeyValueObservation] = []
     private var mouseMonitor: Any?
+    private var keyMonitor: Any?
     private var snapJob: SnapJob?
     private var toastHide: DispatchWorkItem?
     private var activeDownloads: Set<ObjectIdentifier> = []
     private var cancelledDownloads: Set<ObjectIdentifier> = []
-    private var lastProgress: CGFloat = 0
-    private var onStartPage = false
     var profileID: String { profile.id }
     var onClose: (() -> Void)?
 
+    // Every existing menu action, HUD commit, snapshot, and download path
+    // reaches the page through `webView`, so pointing it at the active tab
+    // keeps all of them working untouched.
+    var activeTab: Tab { tabs[activeIndex] }
+    var webView: BrowserWebView { tabs[activeIndex].webView }
+    private var tabBarVisible: Bool { tabs.count > 1 }
+    private var tabBarHeight: CGFloat { tabBarVisible ? TabBarView.height : 0 }
+
     init(profile: BrowserProfile, url: URL?, size: NSSize?, snap: SnapJob?, isPrimary: Bool) {
         self.profile = profile
-        let conf = WKWebViewConfiguration()
-        conf.websiteDataStore = profileStore.websiteDataStore(for: profile)
-        conf.preferences.isElementFullscreenEnabled = true
-        conf.mediaTypesRequiringUserActionForPlayback = []
-        conf.allowsAirPlayForMediaPlayback = true
-        conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
-        if !hasPasskeyEntitlement {
-            let hideWebAuthn = WKUserScript(
-                source: """
-                (function () {
-                  try {
-                    delete window.PublicKeyCredential;
-                    delete window.AuthenticatorResponse;
-                    delete window.AuthenticatorAttestationResponse;
-                    delete window.AuthenticatorAssertionResponse;
-                  } catch (e) {}
-                })();
-                """,
-                injectionTime: .atDocumentStart,
-                forMainFrameOnly: false)
-            conf.userContentController.addUserScript(hideWebAuthn)
-        }
-        webView = BrowserWebView(frame: .zero, configuration: conf)
+        tabs = [Tab(webView: BrowserWebView(
+            frame: .zero, configuration: makeWebConfiguration(for: profile)))]
         snapJob = snap
 
         let contentSize = size ?? NSSize(width: 1160, height: 760)
@@ -530,19 +762,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         container.onLayout = { [weak self] in self?.layoutOverlays() }
         window.contentView = container
 
-        webView.frame = container.bounds
-        webView.autoresizingMask = [.width, .height]
-        webView.onEscape = { [weak self] in self?.escapeToStart() ?? false }
-        webView.navigationDelegate = self
-        webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = true
-        webView.allowsMagnification = true
-        webView.underPageBackgroundColor = NSColor(calibratedWhite: 0.04, alpha: 1)
-        if #available(macOS 13.3, *) { webView.isInspectable = true }
-        container.addSubview(webView)
+        configure(tabs[0])
+        tabs[0].webView.frame = container.bounds
+        container.addSubview(tabs[0].webView)
 
         buildOverlays(in: container)
-        observeWebView()
 
         window.center()
         if isPrimary && snap == nil {
@@ -554,6 +778,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if let size { window.setContentSize(size) }
 
         installMouseMonitor()
+        installKeyMonitor()
 
         if let url { navigate(to: url) } else { loadStartPage() }
         if snap == nil && !profileStore.usesPersistentProfileStores {
@@ -564,6 +789,92 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    // MARK: Tabs
+
+    private func configure(_ tab: Tab) {
+        let wv = tab.webView
+        wv.autoresizingMask = [.width, .height]
+        wv.onEscape = { [weak self] in self?.escapeToStart() ?? false }
+        wv.navigationDelegate = self
+        wv.uiDelegate = self
+        wv.allowsBackForwardNavigationGestures = true
+        wv.allowsMagnification = true
+        wv.underPageBackgroundColor = NSColor(calibratedWhite: 0.04, alpha: 1)
+        if #available(macOS 13.3, *) { wv.isInspectable = true }
+        observe(tab)
+    }
+
+    // `configuration` is non-nil only when WebKit hands us one for window.open
+    // or target=_blank; in that case WebKit drives the load itself.
+    @discardableResult
+    func addTab(url: URL?, configuration: WKWebViewConfiguration? = nil, activate: Bool = true) -> Tab {
+        let conf = configuration ?? makeWebConfiguration(for: profile)
+        let tab = Tab(webView: BrowserWebView(frame: .zero, configuration: conf))
+        configure(tab)
+        tabs.append(tab)
+        if activate { activeIndex = tabs.count - 1 }
+        refreshTabs()
+        if configuration == nil {
+            if let url { load(url, in: tab) } else { loadStartPage(in: tab) }
+        }
+        return tab
+    }
+
+    func selectTab(at index: Int) {
+        guard tabs.indices.contains(index), index != activeIndex else { return }
+        activeIndex = index
+        refreshTabs()
+    }
+
+    func closeTab(at index: Int) {
+        guard tabs.indices.contains(index) else { return }
+        // Closing the only tab closes the window, so ⌘W keeps its old meaning.
+        if tabs.count == 1 { window?.performClose(nil); return }
+        let tab = tabs.remove(at: index)
+        tab.teardown()
+        if activeIndex >= tabs.count {
+            activeIndex = tabs.count - 1
+        } else if index < activeIndex {
+            activeIndex -= 1
+        }
+        refreshTabs()
+    }
+
+    private func refreshTabs() {
+        guard let container = window?.contentView else { return }
+        for tab in tabs where tab !== activeTab && tab.webView.superview != nil {
+            tab.webView.removeFromSuperview()
+        }
+        if activeTab.webView.superview == nil {
+            container.addSubview(activeTab.webView, positioned: .below, relativeTo: tabBar)
+        }
+        tabBar.rebuild(titles: tabs.map(\.displayTitle), activeIndex: activeIndex)
+        tabBar.isHidden = !tabBarVisible
+        // Lay out now rather than next frame, so a switch never paints one
+        // frame of tabs still sitting at their old positions.
+        tabBar.layoutSubtreeIfNeeded()
+        syncWindowTitle()
+        let p = activeTab.lastProgress
+        progressBar.alphaValue = (p > 0 && p < 1) ? 1 : 0
+        layoutOverlays()
+        // The HUD is the address bar for the page you are on, so it must not
+        // survive a tab switch carrying the previous tab's URL.
+        if hud.isHidden {
+            window?.makeFirstResponder(activeTab.webView)
+        } else {
+            hideHUD()
+        }
+    }
+
+    private func tab(for webView: WKWebView) -> Tab? {
+        tabs.first { $0.webView === webView }
+    }
+
+    private func syncWindowTitle() {
+        let t = activeTab.webView.title ?? ""
+        window?.title = "\(t.isEmpty ? "Chromeless" : t) - \(profile.name)"
+    }
 
     // MARK: Chrome (what little there is)
 
@@ -592,7 +903,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
+    // ⌃Tab cannot be a menu key equivalent on macOS, so it is caught here.
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            guard event.modifierFlags.contains(.control), event.keyCode == 48 else { return event }
+            if event.modifierFlags.contains(.shift) {
+                self.showPreviousTab(nil)
+            } else {
+                self.showNextTab(nil)
+            }
+            return nil
+        }
+    }
+
     private func buildOverlays(in container: NSView) {
+        tabBar.onSelect = { [weak self] i in self?.selectTab(at: i) }
+        tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
+        tabBar.onNewTab = { [weak self] in self?.addTab(url: nil) }
+        tabBar.isHidden = true
+        container.addSubview(tabBar)
+
         progressBar.wantsLayer = true
         progressBar.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
         progressBar.alphaValue = 0
@@ -649,6 +980,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         profileLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         profileLabel.textColor = .labelColor
         profileLabel.lineBreakMode = .byTruncatingTail
+        profileBadge.toolTip = "Profile — click to switch"
+        profileBadge.onClick = { [weak self] in
+            guard let self else { return }
+            (NSApp.delegate as? AppDelegate)?.presentProfilePicker(from: self)
+        }
         profileBadge.addSubview(profileLabel)
         container.addSubview(profileBadge)
     }
@@ -656,9 +992,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private func layoutOverlays() {
         guard let contentView = window?.contentView else { return }
         let b = contentView.bounds
+
+        let barH = tabBarHeight
+        tabBar.isHidden = !tabBarVisible
+        tabBar.frame = NSRect(x: 0, y: b.height - barH, width: b.width, height: barH)
+        activeTab.webView.frame = NSRect(x: 0, y: 0, width: b.width, height: b.height - barH)
+
         let hudW = min(620, max(280, b.width - 48))
         let hudH: CGFloat = 52
-        hud.frame = NSRect(x: (b.width - hudW) / 2, y: b.height - hudH - 84, width: hudW, height: hudH)
+        hud.frame = NSRect(x: (b.width - hudW) / 2, y: b.height - barH - hudH - 84,
+                           width: hudW, height: hudH)
         hudField.frame = NSRect(x: 20, y: (hudH - 22) / 2, width: hudW - 40, height: 22)
 
         toastLabel.sizeToFit()
@@ -672,33 +1015,55 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let profileTextW = min(profileMaxW - 22, profileLabel.intrinsicContentSize.width)
         let profileW = max(72, profileTextW + 22)
         let profileH: CGFloat = 24
-        let topInset: CGFloat = isFullScreen ? 18 : 12
-        profileBadge.frame = NSRect(
-            x: b.width - profileW - 14,
-            y: b.height - profileH - topInset,
-            width: profileW,
-            height: profileH)
+
+        // One chip, two homes: docked in the tab bar when it is up, floating in
+        // the corner when it is not.
+        if tabBarVisible {
+            if profileBadge.superview !== tabBar {
+                profileBadge.removeFromSuperview()
+                tabBar.addSubview(profileBadge)
+            }
+            tabBar.setChipWidth(profileW)
+            profileBadge.frame = NSRect(
+                x: b.width - profileW - 12,
+                y: (barH - profileH) / 2,
+                width: profileW,
+                height: profileH)
+        } else {
+            if profileBadge.superview !== contentView {
+                profileBadge.removeFromSuperview()
+                contentView.addSubview(profileBadge)
+            }
+            let topInset: CGFloat = isFullScreen ? 18 : 12
+            profileBadge.frame = NSRect(
+                x: b.width - profileW - 14,
+                y: b.height - profileH - topInset,
+                width: profileW,
+                height: profileH)
+        }
         profileLabel.frame = NSRect(
             x: 11,
             y: (profileH - 14) / 2,
             width: profileW - 22,
             height: 14)
 
-        progressBar.frame = NSRect(x: 0, y: b.height - 2, width: b.width * lastProgress, height: 2)
+        progressBar.frame = NSRect(x: 0, y: b.height - barH - 2,
+                                   width: b.width * activeTab.lastProgress, height: 2)
     }
 
-    private func observeWebView() {
-        observations = [
-            webView.observe(\.estimatedProgress, options: [.new]) { [weak self] wv, _ in
-                self?.progressChanged(wv.estimatedProgress)
+    private func observe(_ tab: Tab) {
+        tab.observations = [
+            tab.webView.observe(\.estimatedProgress, options: [.new]) { [weak self, weak tab] wv, _ in
+                guard let self, let tab else { return }
+                tab.lastProgress = CGFloat(wv.estimatedProgress)
+                if tab === self.activeTab { self.progressChanged(wv.estimatedProgress) }
             },
-            webView.observe(\.title) { [weak self] wv, _ in
-                guard let self else { return }
-                let t = wv.title ?? ""
-                let pageTitle = t.isEmpty ? "Chromeless" : t
-                self.window?.title = "\(pageTitle) - \(self.profile.name)"
+            tab.webView.observe(\.title) { [weak self, weak tab] _, _ in
+                guard let self, let tab else { return }
+                self.tabBar.update(titleAt: self.tabs.firstIndex { $0 === tab }, to: tab.displayTitle)
+                if tab === self.activeTab { self.syncWindowTitle() }
             },
-            webView.observe(\.url) { [profile] wv, _ in
+            tab.webView.observe(\.url) { [profile] wv, _ in
                 if let u = wv.url, u.scheme == "https" || u.scheme == "http" {
                     profileStore.recordVisit(u, for: profile)
                 }
@@ -707,16 +1072,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private func progressChanged(_ progress: Double) {
-        lastProgress = CGFloat(progress)
+        activeTab.lastProgress = CGFloat(progress)
         if let width = window?.contentView?.bounds.width {
-            progressBar.frame.size.width = width * lastProgress
+            progressBar.frame.size.width = width * activeTab.lastProgress
         }
         if progress >= 1.0 {
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.35
                 progressBar.animator().alphaValue = 0
             }, completionHandler: { [weak self] in
-                self?.lastProgress = 0
+                self?.activeTab.lastProgress = 0
                 self?.layoutOverlays()
             })
         } else {
@@ -726,18 +1091,25 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     // MARK: Navigation
 
-    func navigate(to url: URL) {
-        onStartPage = false
+    func load(_ url: URL, in tab: Tab) {
+        tab.onStartPage = false
         if url.isFileURL {
-            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+            tab.webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         } else {
-            webView.load(URLRequest(url: url))
+            tab.webView.load(URLRequest(url: url))
         }
     }
 
+    func loadStartPage(in tab: Tab) {
+        tab.onStartPage = true
+        tab.webView.loadHTMLString(startPageHTML, baseURL: nil)
+        tabBar.update(titleAt: tabs.firstIndex { $0 === tab }, to: tab.displayTitle)
+    }
+
+    func navigate(to url: URL) { load(url, in: activeTab) }
+
     func loadStartPage() {
-        onStartPage = true
-        webView.loadHTMLString(startPageHTML, baseURL: nil)
+        loadStartPage(in: activeTab)
         if let job = snapJob {
             snapJob = nil
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
@@ -747,15 +1119,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private func escapeToStart() -> Bool {
-        if onStartPage { return false }
-        loadStartPage()
+        if activeTab.onStartPage { return false }
+        loadStartPage(in: activeTab)
         return true
     }
 
     // MARK: HUD (the ⌘L address bar)
 
     func showHUD() {
-        if let u = webView.url, !onStartPage, u.absoluteString != "about:blank" {
+        if let u = webView.url, !activeTab.onStartPage, u.absoluteString != "about:blank" {
             hudField.stringValue = u.absoluteString
         } else {
             hudField.stringValue = ""
@@ -847,11 +1219,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     @objc func openLocation(_ sender: Any?) { showHUD() }
 
     @objc func reloadPage(_ sender: Any?) {
-        if onStartPage { loadStartPage() } else { webView.reload() }
+        if activeTab.onStartPage { loadStartPage() } else { webView.reload() }
     }
 
     @objc func hardReloadPage(_ sender: Any?) {
-        if onStartPage { loadStartPage() } else { webView.reloadFromOrigin() }
+        if activeTab.onStartPage { loadStartPage() } else { webView.reloadFromOrigin() }
     }
 
     @objc func goBackAction(_ sender: Any?) { webView.goBack() }
@@ -893,10 +1265,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func showHelpPage(_ sender: Any?) { loadStartPage() }
 
+    @objc func newTabAction(_ sender: Any?) { addTab(url: nil) }
+
+    @objc func closeTabAction(_ sender: Any?) { closeTab(at: activeIndex) }
+
+    @objc func showNextTab(_ sender: Any?) {
+        guard tabs.count > 1 else { return }
+        selectTab(at: (activeIndex + 1) % tabs.count)
+    }
+
+    @objc func showPreviousTab(_ sender: Any?) {
+        guard tabs.count > 1 else { return }
+        selectTab(at: (activeIndex - 1 + tabs.count) % tabs.count)
+    }
+
+    // Tag 1…8 jump to that tab; tag 9 jumps to the last one, as browsers do.
+    @objc func selectTabByNumber(_ sender: NSMenuItem) {
+        selectTab(at: sender.tag == 9 ? tabs.count - 1 : sender.tag - 1)
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(goBackAction(_:)): return webView.canGoBack
         case #selector(goForwardAction(_:)): return webView.canGoForward
+        case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)):
+            return tabs.count > 1
+        case #selector(selectTabByNumber(_:)):
+            return menuItem.tag == 9 ? tabs.count > 1 : menuItem.tag <= tabs.count
+        case #selector(closeTabAction(_:)):
+            menuItem.title = tabs.count > 1 ? "Close Tab" : "Close Window"
+            return true
         case #selector(copyPageURL(_:)):
             return webView.url != nil && webView.url?.absoluteString != "about:blank"
         case #selector(togglePin(_:)):
@@ -913,8 +1311,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func windowWillClose(_ notification: Notification) {
         if let monitor = mouseMonitor { NSEvent.removeMonitor(monitor) }
+        if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
         mouseMonitor = nil
-        observations.removeAll()
+        keyMonitor = nil
+        for tab in tabs { tab.teardown() }
         onClose?()
     }
 
@@ -922,30 +1322,34 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         let u = webView.url?.absoluteString
-        if u != nil && u != "about:blank" { onStartPage = false }
+        if u != nil && u != "about:blank" { tab(for: webView)?.onStartPage = false }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let finished = tab(for: webView) else { return }
+        tabBar.update(titleAt: tabs.firstIndex { $0 === finished }, to: finished.displayTitle)
+        guard finished === activeTab else { return }
         if let job = snapJob {
             snapJob = nil
             runSnapJob(job)
-        } else if onStartPage {
+        } else if finished.onStartPage {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                guard let self, self.onStartPage, self.window?.isKeyWindow == true else { return }
+                guard let self, self.activeTab.onStartPage,
+                      self.window?.isKeyWindow == true else { return }
                 self.showHUD()
             }
         }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        handleLoadError(error)
+        handleLoadError(error, in: webView)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        handleLoadError(error)
+        handleLoadError(error, in: webView)
     }
 
-    private func handleLoadError(_ error: Error) {
+    private func handleLoadError(_ error: Error, in webView: WKWebView) {
         let e = error as NSError
         // Ignore cancelled loads and "frame load interrupted" (downloads, redirects).
         if e.code == NSURLErrorCancelled || e.code == 102 { return }
@@ -953,6 +1357,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             fputs("chromeless: load failed: \(e.localizedDescription)\n", stderr)
             exit(1)
         }
+        // The toast reports on the page you are looking at, so a background
+        // tab failing quietly keeps its error state until you switch to it.
+        guard tab(for: webView) === activeTab else { return }
         showToast("Couldn’t load — \(e.localizedDescription)")
     }
 
@@ -1063,9 +1470,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
                  for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
-        // No tabs, no popups: target=_blank loads right here.
-        if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
-        return nil
+        // --snap is a one-shot screenshot: never fan out into tabs.
+        if launchOptions.snap != nil {
+            if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
+            return nil
+        }
+        // Handing back a live web view lets WebKit drive the load itself, so
+        // window.open + document.write popups work, not just plain links.
+        return addTab(url: nil, configuration: configuration).webView
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
@@ -1145,7 +1557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         controller.window?.makeKeyAndOrderFront(nil)
     }
 
-    @objc func newWindow(_ sender: Any?) { chooseProfileThenOpenWindow() }
+    @objc func newWindow(_ sender: Any?) { presentProfilePicker(from: nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
@@ -1154,10 +1566,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         for url in urls { openWindow(profile: profileStore.defaultProfile, url: url) }
     }
 
-    private func chooseProfileThenOpenWindow() {
+    func presentProfilePicker(from controller: BrowserWindowController?) {
         profilePickerProfiles = profileStore.profiles
-        let preferredID = NSApp.keyWindow
-            .flatMap { window in controllers.first { $0.window === window }?.profileID }
+        let preferredID = controller?.profileID
+            ?? NSApp.keyWindow
+                .flatMap { window in controllers.first { $0.window === window }?.profileID }
             ?? profileStore.defaultProfile.id
         profilePickerSelectedID = profilePickerProfiles.first { $0.id == preferredID }?.id
             ?? profilePickerProfiles.first?.id
@@ -1203,7 +1616,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         case .alertSecondButtonReturn:
             if let profile = selectedPickerProfile() {
                 profileStore.setDefaultProfile(profile)
-                chooseProfileThenOpenWindow()
+                presentProfilePicker(from: nil)
             }
         case .alertThirdButtonReturn:
             createProfileThenOpenWindow()
@@ -1211,7 +1624,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             if let profile = selectedPickerProfile() {
                 confirmDeleteProfile(profile)
             } else {
-                chooseProfileThenOpenWindow()
+                presentProfilePicker(from: nil)
             }
         default:
             break
@@ -1290,7 +1703,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             alert.informativeText = "Close all windows using “\(profile.name)” before deleting that profile."
             alert.addButton(withTitle: "OK")
             alert.runModal()
-            chooseProfileThenOpenWindow()
+            presentProfilePicker(from: nil)
             return
         }
 
@@ -1302,7 +1715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         alert.addButton(withTitle: "Cancel")
 
         guard alert.runModal() == .alertFirstButtonReturn else {
-            chooseProfileThenOpenWindow()
+            presentProfilePicker(from: nil)
             return
         }
 
@@ -1313,7 +1726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                     errorAlert.messageText = "Couldn’t Delete Profile"
                     errorAlert.runModal()
                 }
-                self?.chooseProfileThenOpenWindow()
+                self?.presentProfilePicker(from: nil)
             }
         }
     }
@@ -1339,6 +1752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let fileMenu = NSMenu(title: "File")
         let newWin = fileMenu.addItem(withTitle: "New Window", action: #selector(newWindow(_:)), keyEquivalent: "n")
         newWin.target = self
+        fileMenu.addItem(withTitle: "New Tab",
+                         action: #selector(BrowserWindowController.newTabAction(_:)), keyEquivalent: "t")
         fileMenu.addItem(withTitle: "Open Location…",
                          action: #selector(BrowserWindowController.openLocation(_:)), keyEquivalent: "l")
         fileMenu.addItem(.separator())
@@ -1346,7 +1761,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                                     action: #selector(BrowserWindowController.saveSnapshot(_:)), keyEquivalent: "s")
         snap.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        // ⌘W closes the tab, and closes the window when it is the last one, so
+        // the old muscle memory still lands where it used to.
+        fileMenu.addItem(withTitle: "Close Tab",
+                         action: #selector(BrowserWindowController.closeTabAction(_:)), keyEquivalent: "w")
+        let closeWin = fileMenu.addItem(withTitle: "Close Window",
+                                        action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        closeWin.keyEquivalentModifierMask = [.command, .shift]
         main.addItem(withTitle: "File", action: nil, keyEquivalent: "").submenu = fileMenu
 
         let editMenu = NSMenu(title: "Edit")
@@ -1392,6 +1813,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        let nextTab = windowMenu.addItem(withTitle: "Show Next Tab",
+                                         action: #selector(BrowserWindowController.showNextTab(_:)),
+                                         keyEquivalent: "]")
+        nextTab.keyEquivalentModifierMask = [.command, .shift]
+        let prevTab = windowMenu.addItem(withTitle: "Show Previous Tab",
+                                         action: #selector(BrowserWindowController.showPreviousTab(_:)),
+                                         keyEquivalent: "[")
+        prevTab.keyEquivalentModifierMask = [.command, .shift]
+        for n in 1...9 {
+            let item = windowMenu.addItem(
+                withTitle: n == 9 ? "Show Last Tab" : "Show Tab \(n)",
+                action: #selector(BrowserWindowController.selectTabByNumber(_:)),
+                keyEquivalent: "\(n)")
+            item.tag = n
+        }
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "Pin on Top",
                            action: #selector(BrowserWindowController.togglePin(_:)), keyEquivalent: "p")
