@@ -10,6 +10,7 @@
 //   ⌘[ ⌘]  back / forward        ⌃⌘F  fullscreen
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //   ⌘T  new tab                  ⌃Tab  next tab
+//   ⇧⌘B  allow ads here          ⌃⇧⌘E  pick an element to hide
 //   ⌘click  link → background tab   ⇧⌘click  → foreground tab
 //
 // CLI screenshot mode:
@@ -87,6 +88,7 @@ func parseLaunchOptions() -> LaunchOptions {
               --restore         reopen the last saved page instead of the start page
               --profile <name>  use a specific profile
               --profiles        list profiles and exit
+              --adblock-selftest  check the filter converter and exit
 
             examples:
               chromeless youtube.com
@@ -113,6 +115,10 @@ func parseLaunchOptions() -> LaunchOptions {
             if i < args.count { opts.profile = args[i] }
         case "--profiles":
             opts.listProfiles = true
+        case "--adblock-selftest":
+            runAdBlockSelfTest()
+        case "--adblock-compiletest":
+            runAdBlockCompileTest()
         default:
             if a.hasPrefix("-") {
                 fputs("chromeless: ignoring unknown option \(a)\n", stderr)
@@ -379,9 +385,13 @@ let startPageHTML = """
 <style>
   html, body { height: 100%; margin: 0; }
   body { background: #0a0a0e; color: #e8e8ee; font: 15px/1.6 -apple-system, system-ui;
-         display: flex; align-items: center; justify-content: center;
+         display: flex; justify-content: center; overflow-y: auto;
          -webkit-user-select: none; cursor: default; }
-  main { text-align: center; max-width: 680px; padding: 48px; animation: in .6s ease-out; }
+  /* `margin: auto` centres the same way `align-items: center` does, minus its
+     one flaw: when the list is taller than the window, that property overflows
+     equally in both directions and the top scrolls out of reach. */
+  main { text-align: center; max-width: 680px; padding: 48px; margin: auto;
+         animation: in .6s ease-out; }
   @keyframes in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
   h1 { font-size: 46px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 6px; color: #fff; }
   p.tag { color: #85858f; margin: 0 0 46px; font-size: 16px; }
@@ -391,7 +401,8 @@ let startPageHTML = """
   kbd { font: 600 12px ui-monospace, "SF Mono", monospace; background: #1b1b22;
         border: 1px solid #2c2c36; border-bottom-width: 2px; border-radius: 6px;
         padding: 2.5px 8px; color: #e8e8ee; white-space: nowrap; }
-  footer { margin-top: 48px; color: #55555e; font-size: 12px; }
+  footer { margin-top: 44px; color: #55555e; font-size: 12px; line-height: 2; }
+  footer b { color: #8a8a97; font-weight: 600; }
 </style></head>
 <body><main>
   <h1>chromeless</h1>
@@ -409,8 +420,11 @@ let startPageHTML = """
     <div class="k"><kbd>esc</kbd></div>             <div>bail out &mdash; back to this page</div>
     <div class="k"><kbd>&#8984; =</kbd> <kbd>&#8984; &minus;</kbd> <kbd>&#8984; 0</kbd></div><div>zoom</div>
     <div class="k"><kbd>&#8679;&#8984; C</kbd></div><div>copy current url</div>
+    <div class="k"><kbd>&#8679;&#8984; B</kbd></div><div>ads are blocked everywhere &mdash; this lets them through on one site</div>
+    <div class="k"><kbd>&#8963;&#8679;&#8984; E</kbd></div><div>point at anything on the page and hide it for good</div>
   </div>
-  <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window</footer>
+  <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
+  <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b></footer>
 </main></body></html>
 """
 
@@ -423,6 +437,9 @@ final class BrowserWebView: WKWebView {
     // Set by the owning window controller. Fed by `AuxClickRouter` for a
     // middle-click, and by `openLinkInNewTab` for a ⌘-click.
     var onOpenLinkInNewTab: ((URL, _ background: Bool) -> Void)?
+    // Fed by `AdBlockPickerRouter` once the element picker has a selector, or
+    // nil when the element could not be named safely.
+    var onPickedSelector: ((String?) -> Void)?
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53, // Esc
@@ -583,6 +600,7 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     conf.allowsAirPlayForMediaPlayback = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
     conf.userContentController.add(AuxClickRouter.shared, name: AuxClickRouter.messageName)
+    conf.userContentController.add(AdBlockPickerRouter.shared, name: AdBlockPickerRouter.messageName)
     conf.userContentController.addUserScript(WKUserScript(
         source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
     if !hasPasskeyEntitlement {
@@ -1066,6 +1084,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         wv.onOpenLinkInNewTab = { [weak self] url, background in
             _ = self?.addTab(url: url, activate: !background)
         }
+        wv.onPickedSelector = { [weak self] selector in
+            guard let self else { return }
+            guard let selector else {
+                self.showToast("That element can’t be targeted safely")
+                return
+            }
+            // The rule is compiled by the time this runs, but the page in front
+            // of the user was laid out before it existed.
+            self.showToast("Hiding \(selector)")
+            self.reloadPage(nil)
+        }
+        adBlockManager.register(wv)
         wv.navigationDelegate = self
         wv.uiDelegate = self
         wv.allowsBackForwardNavigationGestures = true
@@ -1650,6 +1680,38 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func showHelpPage(_ sender: Any?) { loadStartPage() }
 
+    // MARK: Ad blocking
+
+    @objc func toggleSiteBlocking(_ sender: Any?) {
+        guard let url = webView.url, let domain = AdBlockManager.domain(for: url) else {
+            showToast("Nothing to allow or block here")
+            return
+        }
+        let blocking = adBlockManager.isBlocking(url)
+        showToast(blocking ? "Ads allowed on \(domain)" : "Blocking ads on \(domain)")
+        adBlockManager.setBlocking(!blocking, for: url) { [weak self] in
+            self?.reloadPage(nil)
+        }
+    }
+
+    @objc func pickElementToBlock(_ sender: Any?) {
+        guard !activeTab.onStartPage, webView.url != nil else {
+            showToast("Open a page first")
+            return
+        }
+        // The script's own return value is undefined, which WebKit reports as an
+        // error; a trailing literal keeps the completion honest about failures
+        // that actually matter.
+        webView.evaluateJavaScript(adBlockPickerScript + "\ntrue;") { [weak self] _, error in
+            guard let error else { return }
+            self?.showToast("Picker failed — \(error.localizedDescription)")
+        }
+    }
+
+    @objc func showAdBlockSettings(_ sender: Any?) {
+        AdBlockSettingsWindowController.shared.present()
+    }
+
     @objc func newTabAction(_ sender: Any?) { addTab(url: nil) }
 
     @objc func closeTabAction(_ sender: Any?) { closeTab(at: activeIndex) }
@@ -1685,6 +1747,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(togglePin(_:)):
             menuItem.state = window?.level == .floating ? .on : .off
             return true
+        case #selector(toggleSiteBlocking(_:)):
+            menuItem.state = adBlockManager.isBlocking(webView.url) ? .on : .off
+            return adBlockManager.settings.enabled && AdBlockManager.domain(for: webView.url) != nil
+        case #selector(pickElementToBlock(_:)):
+            return !activeTab.onStartPage && webView.url != nil
         default: return true
         }
     }
@@ -1868,6 +1935,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+
+        // Compiling takes a moment, and the first page can load before the list
+        // is ready. Reloading it out from under the user to catch a handful of
+        // early requests would be worse than missing them.
+        adBlockManager.rebuild()
+        if launchOptions.snap == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                adBlockManager.updateAll(force: false)
+            }
+        }
 
         guard let profile = profileStore.profile(matching: launchOptions.profile) else {
             fputs("chromeless: profile not found: \(launchOptions.profile ?? "")\n", stderr)
@@ -2164,6 +2241,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             withTitle: "Show Downloads",
             action: #selector(BrowserWindowController.toggleDownloadsPanel(_:)), keyEquivalent: "j")
         downloads.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(.separator())
+        let siteBlocking = viewMenu.addItem(
+            withTitle: "Block Ads on This Site",
+            action: #selector(BrowserWindowController.toggleSiteBlocking(_:)), keyEquivalent: "b")
+        siteBlocking.keyEquivalentModifierMask = [.command, .shift]
+        let picker = viewMenu.addItem(
+            withTitle: "Pick Element to Hide…",
+            action: #selector(BrowserWindowController.pickElementToBlock(_:)), keyEquivalent: "e")
+        picker.keyEquivalentModifierMask = [.command, .shift, .control]
+        viewMenu.addItem(withTitle: "Ad Blocking…",
+                         action: #selector(BrowserWindowController.showAdBlockSettings(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let fullScreen = viewMenu.addItem(withTitle: "Enter Full Screen",
                                           action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")

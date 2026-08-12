@@ -39,6 +39,8 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘1`…`⌘8` `⌘9` | Jump to the nth tab / the last tab |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab (`⇧⌘]` `⇧⌘[` too) |
 | `⌘N` | New profile window |
+| `⇧⌘B` | Block ads on this site — off turns the blocker off for that site only |
+| `⌃⇧⌘E` | Pick an element on the page to hide for good |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
 Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
@@ -69,6 +71,43 @@ The selected default profile is used when launching without `--profile`, opening
 
 Deleting a profile asks for confirmation and removes its profile metadata plus WebKit website data. Close all windows using that profile before deleting it.
 
+## Ad blocking
+
+On by default, using WebKit's own content-blocker engine — the same mechanism
+Safari content-blocker extensions use. Rules are compiled once into a
+`WKContentRuleList` and matched inside WebKit's networking process, so blocking
+costs nothing at page load. No proxy, no request interception, no extension.
+
+Chromeless ships a small built-in list and subscribes to **EasyList**,
+**EasyPrivacy**, and **ABPVN** on first launch, refreshing them weekly. Together
+they compile to about 114,000 rules. **View → Ad Blocking…** manages
+subscriptions, adds your own list URLs, edits your own filter rules, and lists
+the sites you turned blocking off for.
+
+- `⇧⌘B` toggles blocking for the site you are on. Some sites do break without
+  their ad frames; this is the escape hatch.
+- `⌃⇧⌘E` starts the element picker: hover to highlight, `↑`/`↓` to grow or
+  shrink the selection, click to hide it for good, `esc` to cancel. The rule is
+  saved as `domain##selector` in your own rules. Picked elements are hidden, not
+  blocked — the bytes still arrive.
+- Rules use AdBlock Plus syntax, so any list in that format can be added.
+
+Settings live in `~/Library/Application Support/Chromeless/AdBlock/`, shared by
+every profile.
+
+Three things it deliberately does not do:
+
+- **No YouTube ads.** They stream from the same hosts as the video, so no
+  content rule can separate them.
+- **No "N ads blocked" counter.** WebKit reports nothing about what it blocked,
+  so any number would be made up. The panel shows active rules instead.
+- **No scriptlet injection** (`##+js(...)`, `#%#`). Unsupported filter lines are
+  counted and skipped — about 1.2% of EasyList and EasyPrivacy combined.
+
+The first launch after a filter list changes spends a few seconds converting and
+compiling; pages loaded in that window are not blocked. Afterwards the compiled
+list is cached and blocking is live before the first request goes out.
+
 ## CLI
 
 ```text
@@ -79,7 +118,13 @@ usage: chromeless [url] [options]
   --restore         reopen the selected profile's last saved page
   --profile <name>  use a specific profile
   --profiles        list profiles and exit
+  --adblock-selftest    check the filter converter and exit
+  --adblock-compiletest convert every installed list and compile it for real
 ```
+
+`--adblock-compiletest` is the one that matters when changing the converter: it
+pushes the real lists through WebKit's compiler, which rejects constructs the
+unit checks cannot know about.
 
 ## CLI screenshot mode
 
