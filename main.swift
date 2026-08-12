@@ -1893,6 +1893,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         return addTab(url: nil, configuration: configuration).webView
     }
 
+    // A sign-in popup hands its result back to the opener and then calls
+    // `window.close()`. Opened as a tab it has no window of its own to close, so
+    // without this every trip through an identity provider leaves a spent tab
+    // behind — which is what a returning SSO flow looks like from the outside.
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let index = tabs.firstIndex(where: { $0.webView === webView }) else { return }
+        closeTab(at: index)
+    }
+
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         let alert = NSAlert()
