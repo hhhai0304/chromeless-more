@@ -10,6 +10,8 @@
 //   ⌘[ ⌘]  back / forward        ⌃⌘F  fullscreen
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //   ⌘T  new tab                  ⌃Tab  next tab
+//   ⇧⌘B  allow ads here          ⌃⇧⌘E  pick an element to hide
+//   ⌘click  link → background tab   ⇧⌘click  → foreground tab
 //
 // CLI screenshot mode:
 //   chromeless https://example.com --snap out.png --size 1440x900 --wait 2
@@ -86,6 +88,7 @@ func parseLaunchOptions() -> LaunchOptions {
               --restore         reopen the last saved page instead of the start page
               --profile <name>  use a specific profile
               --profiles        list profiles and exit
+              --adblock-selftest  check the filter converter and exit
 
             examples:
               chromeless youtube.com
@@ -112,6 +115,10 @@ func parseLaunchOptions() -> LaunchOptions {
             if i < args.count { opts.profile = args[i] }
         case "--profiles":
             opts.listProfiles = true
+        case "--adblock-selftest":
+            runAdBlockSelfTest()
+        case "--adblock-compiletest":
+            runAdBlockCompileTest()
         default:
             if a.hasPrefix("-") {
                 fputs("chromeless: ignoring unknown option \(a)\n", stderr)
@@ -378,9 +385,13 @@ let startPageHTML = """
 <style>
   html, body { height: 100%; margin: 0; }
   body { background: #0a0a0e; color: #e8e8ee; font: 15px/1.6 -apple-system, system-ui;
-         display: flex; align-items: center; justify-content: center;
+         display: flex; justify-content: center; overflow-y: auto;
          -webkit-user-select: none; cursor: default; }
-  main { text-align: center; max-width: 680px; padding: 48px; animation: in .6s ease-out; }
+  /* `margin: auto` centres the same way `align-items: center` does, minus its
+     one flaw: when the list is taller than the window, that property overflows
+     equally in both directions and the top scrolls out of reach. */
+  main { text-align: center; max-width: 680px; padding: 48px; margin: auto;
+         animation: in .6s ease-out; }
   @keyframes in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
   h1 { font-size: 46px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 6px; color: #fff; }
   p.tag { color: #85858f; margin: 0 0 46px; font-size: 16px; }
@@ -390,7 +401,8 @@ let startPageHTML = """
   kbd { font: 600 12px ui-monospace, "SF Mono", monospace; background: #1b1b22;
         border: 1px solid #2c2c36; border-bottom-width: 2px; border-radius: 6px;
         padding: 2.5px 8px; color: #e8e8ee; white-space: nowrap; }
-  footer { margin-top: 48px; color: #55555e; font-size: 12px; }
+  footer { margin-top: 44px; color: #55555e; font-size: 12px; line-height: 2; }
+  footer b { color: #8a8a97; font-weight: 600; }
 </style></head>
 <body><main>
   <h1>chromeless</h1>
@@ -400,6 +412,7 @@ let startPageHTML = """
     <div class="k"><kbd>&#8984; T</kbd></div>       <div>new tab &mdash; the tab bar shows up from the second one</div>
     <div class="k"><kbd>&#8963;&#8677;</kbd></div>  <div>next tab &mdash; <kbd>&#8984;1</kbd>&hellip;<kbd>&#8984;9</kbd> jump straight there</div>
     <div class="k"><kbd>&#8984; drag</kbd></div>    <div>move the window</div>
+    <div class="k"><kbd>&#8984; click</kbd></div>   <div>open a link in a background tab &mdash; middle-click too, <kbd>&#8679;&#8984;</kbd> to jump there</div>
     <div class="k"><kbd>&#8963;&#8984; F</kbd></div><div>fullscreen</div>
     <div class="k"><kbd>&#8679;&#8984; S</kbd></div><div>snapshot the page &rarr; desktop</div>
     <div class="k"><kbd>&#8984; P</kbd></div>       <div>pin on top of every window</div>
@@ -407,8 +420,11 @@ let startPageHTML = """
     <div class="k"><kbd>esc</kbd></div>             <div>bail out &mdash; back to this page</div>
     <div class="k"><kbd>&#8984; =</kbd> <kbd>&#8984; &minus;</kbd> <kbd>&#8984; 0</kbd></div><div>zoom</div>
     <div class="k"><kbd>&#8679;&#8984; C</kbd></div><div>copy current url</div>
+    <div class="k"><kbd>&#8679;&#8984; B</kbd></div><div>ads are blocked everywhere &mdash; this lets them through on one site</div>
+    <div class="k"><kbd>&#8963;&#8679;&#8984; E</kbd></div><div>point at anything on the page and hide it for good</div>
   </div>
-  <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window</footer>
+  <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
+  <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b></footer>
 </main></body></html>
 """
 
@@ -418,6 +434,12 @@ final class BrowserWebView: WKWebView {
     // Bare Esc escapes back to the start page — unless fullscreen needs it,
     // or the ⌘L HUD is open (its field is first responder and handles Esc itself).
     var onEscape: (() -> Bool)?
+    // Set by the owning window controller. Fed by `AuxClickRouter` for a
+    // middle-click, and by `openLinkInNewTab` for a ⌘-click.
+    var onOpenLinkInNewTab: ((URL, _ background: Bool) -> Void)?
+    // Fed by `AdBlockPickerRouter` once the element picker has a selector, or
+    // nil when the element could not be named safely.
+    var onPickedSelector: ((String?) -> Void)?
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53, // Esc
@@ -430,13 +452,62 @@ final class BrowserWebView: WKWebView {
         super.keyDown(with: event)
     }
 
-    // ⌘-drag anywhere moves the window; mouse buttons 4/5 go back/forward.
+    // ⌘ is overloaded: ⌘-drag moves the window, ⌘-click opens the link under
+    // the cursor in a new tab. Which one it is is not knowable at mouse-down,
+    // so the press is held until the pointer either moves or comes back up.
+    // Mouse buttons 4/5 go back/forward.
     override func mouseDown(with event: NSEvent) {
-        if event.modifierFlags.contains(.command) {
-            window?.performDrag(with: event)
+        guard event.modifierFlags.contains(.command) else {
+            super.mouseDown(with: event)
             return
         }
-        super.mouseDown(with: event)
+        let start = event.locationInWindow
+        var dragged = false
+        window?.trackEvents(matching: [.leftMouseDragged, .leftMouseUp],
+                            timeout: .infinity, mode: .eventTracking) { moved, stop in
+            guard let moved else { stop.pointee = true; return }
+            if moved.type == .leftMouseDragged {
+                let p = moved.locationInWindow
+                // Same 4pt slop the tab drag uses, so a shaky hand still clicks.
+                guard hypot(p.x - start.x, p.y - start.y) >= 4 else { return }
+                dragged = true
+            }
+            stop.pointee = true
+        }
+        if dragged {
+            window?.performDrag(with: event)
+        } else {
+            openLinkInNewTab(at: convert(start, from: nil),
+                             background: !event.modifierFlags.contains(.shift))
+        }
+    }
+
+    // The page never sees this click — it was swallowed above — so the link has
+    // to be found by asking the document what sits at that point. Only the main
+    // frame is searched; a ⌘-click inside an iframe finds nothing. Middle-click
+    // has no such limit, since it is handled by a script injected into every
+    // frame.
+    private func openLinkInNewTab(at point: NSPoint, background: Bool) {
+        // elementFromPoint wants CSS pixels down from the top-left of the
+        // viewport. WKWebView is flipped, so the converted point already counts
+        // downwards; only the zoom has to be divided out.
+        let scale = pageZoom * magnification
+        guard scale > 0, isFlipped else { return }
+        let x = point.x / scale
+        let y = point.y / scale
+        evaluateJavaScript("""
+        (function () {
+          var n = document.elementFromPoint(\(x), \(y));
+          while (n && n.nodeType === 1) {
+            if (n.tagName === "A" && n.href) return n.href;
+            n = n.parentNode;
+          }
+          return null;
+        })();
+        """) { [weak self] result, _ in
+            guard let href = result as? String, let url = URL(string: href) else { return }
+            self?.onOpenLinkInNewTab?(url, background)
+        }
     }
     override func otherMouseUp(with event: NSEvent) {
         if event.buttonNumber == 3, canGoBack { goBack(); return }
@@ -476,6 +547,51 @@ final class ProfileChipView: NSVisualEffectView {
 
 // MARK: - Tabs
 
+// WebKit does not treat a middle-click on a link as a request for a new window
+// — it never calls `createWebViewWith` and just navigates the current frame,
+// which is worse than doing nothing. So the page has to be taught: cancel the
+// default action and hand the href back for a background tab.
+private let auxClickScript = """
+(function () {
+  function anchor(node) {
+    while (node && node.nodeType === 1) {
+      if (node.tagName === "A" && node.href) return node;
+      node = node.parentNode;
+    }
+    return null;
+  }
+  function swallow(e) {
+    if (e.button === 1 && anchor(e.target)) e.preventDefault();
+  }
+  // The navigation is suppressed on the way down and the href reported on the
+  // way up, so the gesture only counts once the button is actually released.
+  document.addEventListener("mousedown", swallow, true);
+  document.addEventListener("auxclick", function (e) {
+    if (e.button !== 1) return;
+    var a = anchor(e.target);
+    if (!a) return;
+    e.preventDefault();
+    e.stopPropagation();
+    window.webkit.messageHandlers.chromelessAuxClick.postMessage(a.href);
+  }, true);
+})();
+"""
+
+// One shared handler for every web view: it routes by the message's own web
+// view, so it never needs to know which window or profile the page belongs to.
+final class AuxClickRouter: NSObject, WKScriptMessageHandler {
+    static let shared = AuxClickRouter()
+    static let messageName = "chromelessAuxClick"
+
+    func userContentController(_ controller: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard let webView = message.webView as? BrowserWebView,
+              let href = message.body as? String,
+              let url = URL(string: href) else { return }
+        webView.onOpenLinkInNewTab?(url, true)
+    }
+}
+
 func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration {
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = profileStore.websiteDataStore(for: profile)
@@ -483,6 +599,10 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     conf.mediaTypesRequiringUserActionForPlayback = []
     conf.allowsAirPlayForMediaPlayback = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
+    conf.userContentController.add(AuxClickRouter.shared, name: AuxClickRouter.messageName)
+    conf.userContentController.add(AdBlockPickerRouter.shared, name: AdBlockPickerRouter.messageName)
+    conf.userContentController.addUserScript(WKUserScript(
+        source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
     if !hasPasskeyEntitlement {
         let hideWebAuthn = WKUserScript(
             source: """
@@ -529,13 +649,20 @@ final class Tab {
 }
 
 final class TabItemView: NSView {
-    var onSelect: (() -> Void)?
-    var onClose: (() -> Void)?
+    // The callbacks hand back the view rather than an index, so TabBarView can
+    // read `index` at call time. Baking the index into the closure only worked
+    // while every item was thrown away and rebuilt after each change.
+    var onSelect: ((TabItemView) -> Void)?
+    var onClose: ((TabItemView) -> Void)?
+    var onDragBegin: ((TabItemView, NSEvent) -> Void)?
+
+    var index = 0
 
     private let label = NSTextField(labelWithString: "")
     private let closeButton = NSButton()
     private var hovering = false
     private var trackingAreaRef: NSTrackingArea?
+    private var middleDownInside = false
 
     var isActive = false { didSet { applyStyle(); needsLayout = true } }
     var title = "" {
@@ -572,7 +699,7 @@ final class TabItemView: NSView {
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    @objc private func closeClicked() { onClose?() }
+    @objc private func closeClicked() { onClose?(self) }
 
     private func applyStyle() {
         layer?.backgroundColor = isActive
@@ -605,7 +732,39 @@ final class TabItemView: NSView {
         needsLayout = true
     }
 
-    override func mouseDown(with event: NSEvent) { onSelect?() }
+    // Claim the press before it reaches the title label, so the middle-click
+    // bounds check below is against the tab's own geometry. The close button is
+    // the one exception, since it needs its own tracking.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        let local = convert(point, from: superview)
+        guard bounds.contains(local) else { return nil }
+        if !closeButton.isHidden, closeButton.frame.contains(local) { return closeButton }
+        return self
+    }
+
+    // Selecting on press is what every browser does, so it happens before the
+    // drag is even considered; the bar decides afterwards whether the gesture
+    // turns into a reorder.
+    override func mouseDown(with event: NSEvent) {
+        onSelect?(self)
+        onDragBegin?(self, event)
+    }
+
+    // Middle-click closes, but only on release and only if the cursor never
+    // left the tab — sliding off before letting go cancels, the way it does for
+    // every other destructive click on macOS.
+    override func otherMouseDown(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return super.otherMouseDown(with: event) }
+        middleDownInside = true
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2, middleDownInside else {
+            return super.otherMouseUp(with: event)
+        }
+        middleDownInside = false
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClose?(self) }
+    }
 
     override func layout() {
         super.layout()
@@ -626,10 +785,15 @@ final class TabBarView: NSVisualEffectView {
     var onSelect: ((Int) -> Void)?
     var onClose: ((Int) -> Void)?
     var onNewTab: (() -> Void)?
+    var onReorder: ((Int, Int) -> Void)?
 
     private var items: [TabItemView] = []
     private let addButton = NSButton()
     private var chipWidth: CGFloat = 0
+    // Set only while a drag is live. `layout()` leaves this item alone; without
+    // that, any layout pass mid-gesture snaps it back to its slot.
+    private var dragItem: TabItemView?
+    private var dragToken = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -653,16 +817,41 @@ final class TabBarView: NSVisualEffectView {
 
     @objc private func addClicked() { onNewTab?() }
 
+    // With the tab bar up, the window is `isMovable = false` (see `refreshTabs`),
+    // so the empty part of the strip has to move the window by hand. Presses on
+    // a tab never reach here — items are subviews and take their own events.
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
+    // Middle-clicking the strip itself opens a tab. Items are subviews, so a
+    // middle-click that lands on a tab is hit-tested there and never gets here.
+    override func otherMouseUp(with event: NSEvent) {
+        guard event.buttonNumber == 2 else { return super.otherMouseUp(with: event) }
+        onNewTab?()
+    }
+
+    // Items are reused across rebuilds rather than recreated. A drag holds on
+    // to the view it is moving, and selecting a tab rebuilds the bar, so tearing
+    // the views down would kill the gesture on its first frame.
     func rebuild(titles: [String], activeIndex: Int) {
-        for item in items { item.removeFromSuperview() }
-        items = titles.enumerated().map { index, title in
+        while items.count > titles.count {
+            let gone = items.removeLast()
+            if gone === dragItem { dragItem = nil }
+            gone.removeFromSuperview()
+        }
+        while items.count < titles.count {
             let item = TabItemView(frame: .zero)
-            item.title = title
-            item.isActive = index == activeIndex
-            item.onSelect = { [weak self] in self?.onSelect?(index) }
-            item.onClose = { [weak self] in self?.onClose?(index) }
+            item.onSelect = { [weak self] in self?.onSelect?($0.index) }
+            item.onClose = { [weak self] in self?.onClose?($0.index) }
+            item.onDragBegin = { [weak self] in self?.beginDrag($0, with: $1) }
             addSubview(item, positioned: .below, relativeTo: addButton)
-            return item
+            items.append(item)
+        }
+        for (index, item) in items.enumerated() {
+            item.index = index
+            item.title = titles[index]
+            item.isActive = index == activeIndex
         }
         needsLayout = true
     }
@@ -678,30 +867,121 @@ final class TabBarView: NSVisualEffectView {
         needsLayout = true
     }
 
+    // Slot geometry, shared by `layout()` and the drag loop so a dragged tab
+    // lands on exactly the position layout would have given it.
+    private var tabPitch: CGFloat {
+        let addW: CGFloat = 26
+        let available = max(0, bounds.width - Self.trafficLightInset - (chipWidth + 18) - addW - 8)
+        return min(190, max(90, available / CGFloat(max(1, items.count))))
+    }
+
+    private func slotFrame(_ index: Int) -> NSRect {
+        NSRect(x: Self.trafficLightInset + tabPitch * CGFloat(index), y: 3,
+               width: max(40, tabPitch - 3), height: bounds.height - 6)
+    }
+
     override func layout() {
         super.layout()
-        let b = bounds
-        let left = Self.trafficLightInset
+        for (index, item) in items.enumerated() where item !== dragItem {
+            item.frame = slotFrame(index)
+        }
         let addW: CGFloat = 26
         let rightReserve = chipWidth + 18
-        let available = max(0, b.width - left - rightReserve - addW - 8)
-        let count = max(1, items.count)
-        let tabW = min(190, max(90, available / CGFloat(count)))
+        let x = Self.trafficLightInset + tabPitch * CGFloat(items.count)
+        addButton.frame = NSRect(
+            x: min(x + 2, max(Self.trafficLightInset, bounds.width - rightReserve - addW)),
+            y: (bounds.height - 22) / 2, width: addW, height: 22)
+    }
 
-        var x = left
-        for item in items {
-            item.frame = NSRect(x: x, y: 3, width: max(40, tabW - 3), height: b.height - 6)
-            x += tabW
+    // MARK: Drag to reorder
+
+    private func settle(_ index: Int, of item: TabItemView) {
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            item.animator().frame = slotFrame(index)
         }
-        addButton.frame = NSRect(x: min(x + 2, max(left, b.width - rightReserve - addW)),
-                                 y: (b.height - 22) / 2, width: addW, height: 22)
+    }
+
+    private func beginDrag(_ item: TabItemView, with event: NSEvent) {
+        guard let window, items.count > 1 else { return }
+        dragToken += 1
+        let token = dragToken
+        let start = convert(event.locationInWindow, from: nil)
+        let grabOffset = start.x - item.frame.origin.x
+        let startIndex = items.firstIndex(of: item) ?? item.index
+        let originalOrder = items
+        var currentIndex = startIndex
+        var live = false
+        var cancelled = false
+
+        window.trackEvents(matching: [.leftMouseDragged, .leftMouseUp, .keyDown],
+                           timeout: .infinity, mode: .eventTracking) { event, stop in
+            guard let event else { stop.pointee = true; return }
+            switch event.type {
+            case .keyDown:
+                guard event.keyCode == 53 else { return } // Esc
+                cancelled = true
+                self.items = originalOrder
+                stop.pointee = true
+
+            case .leftMouseDragged:
+                let p = self.convert(event.locationInWindow, from: nil)
+                if !live {
+                    // Below this the gesture is still a click, not a drag.
+                    guard abs(p.x - start.x) >= 4 else { return }
+                    live = true
+                    self.dragItem = item
+                    self.addSubview(item, positioned: .below, relativeTo: self.addButton)
+                }
+                let pitch = self.tabPitch
+                let maxX = Self.trafficLightInset + pitch * CGFloat(self.items.count - 1)
+                item.frame.origin.x = min(max(p.x - grabOffset, Self.trafficLightInset), maxX)
+
+                let raw = Int(((item.frame.origin.x - Self.trafficLightInset) / pitch).rounded())
+                let target = min(max(raw, 0), self.items.count - 1)
+                guard target != currentIndex else { return }
+                self.items.remove(at: currentIndex)
+                self.items.insert(item, at: target)
+                currentIndex = target
+                for (index, other) in self.items.enumerated() where other !== item {
+                    self.settle(index, of: other)
+                }
+
+            case .leftMouseUp:
+                stop.pointee = true
+
+            default:
+                break
+            }
+        }
+
+        guard live else { return }
+        let finalIndex = cancelled ? startIndex : currentIndex
+        // `dragItem` stays set until the settle animation finishes, so the
+        // relayout that `onReorder` triggers does not yank the tab into place
+        // and cut the animation short.
+        settle(finalIndex, of: item)
+        // Keyed on the drag, not the view: starting a second drag on the same tab
+        // inside the settle window would otherwise clear `dragItem` underneath it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            guard let self, self.dragToken == token else { return }
+            self.dragItem = nil
+            self.needsLayout = true
+        }
+        if cancelled {
+            for (index, other) in items.enumerated() where other !== item {
+                settle(index, of: other)
+            }
+        } else if finalIndex != startIndex {
+            onReorder?(startIndex, finalIndex)
+        }
     }
 }
 
 // MARK: - Browser window
 
 final class BrowserWindowController: NSWindowController, NSWindowDelegate,
-    WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, NSTextFieldDelegate, NSMenuItemValidation {
+    WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate, NSMenuItemValidation {
 
     private(set) var tabs: [Tab] = []
     private(set) var activeIndex = 0
@@ -718,8 +998,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var keyMonitor: Any?
     private var snapJob: SnapJob?
     private var toastHide: DispatchWorkItem?
-    private var activeDownloads: Set<ObjectIdentifier> = []
-    private var cancelledDownloads: Set<ObjectIdentifier> = []
+    private let downloadsPanel = DownloadsPanelView()
+    private var downloadsPanelPinned = false
+    private var downloadsHide: DispatchWorkItem?
+    private var downloadsObservers: [NSObjectProtocol] = []
+    // ⌥ is read when the navigation is still an action, because a response
+    // download arrives a round trip later, by which time the key is released.
+    private var pendingDownloadWantsPanel = false
     var profileID: String { profile.id }
     var onClose: (() -> Void)?
 
@@ -796,6 +1081,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let wv = tab.webView
         wv.autoresizingMask = [.width, .height]
         wv.onEscape = { [weak self] in self?.escapeToStart() ?? false }
+        wv.onOpenLinkInNewTab = { [weak self] url, background in
+            _ = self?.addTab(url: url, activate: !background)
+        }
+        wv.onPickedSelector = { [weak self] selector in
+            guard let self else { return }
+            guard let selector else {
+                self.showToast("That element can’t be targeted safely")
+                return
+            }
+            // The rule is compiled by the time this runs, but the page in front
+            // of the user was laid out before it existed.
+            self.showToast("Hiding \(selector)")
+            self.reloadPage(nil)
+        }
+        adBlockManager.register(wv)
         wv.navigationDelegate = self
         wv.uiDelegate = self
         wv.allowsBackForwardNavigationGestures = true
@@ -841,6 +1141,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         refreshTabs()
     }
 
+    // Reordering only permutes the array; no web view is created, destroyed, or
+    // reparented, so the page being viewed never notices.
+    func moveTab(from: Int, to: Int) {
+        guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
+        tabs.insert(tabs.remove(at: from), at: to)
+        // Keep whichever tab was active active, wherever it ended up.
+        if activeIndex == from {
+            activeIndex = to
+        } else if from < activeIndex, activeIndex <= to {
+            activeIndex -= 1
+        } else if to <= activeIndex, activeIndex < from {
+            activeIndex += 1
+        }
+        refreshTabs()
+    }
+
     private func refreshTabs() {
         guard let container = window?.contentView else { return }
         for tab in tabs where tab !== activeTab && tab.webView.superview != nil {
@@ -851,6 +1167,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
         tabBar.rebuild(titles: tabs.map(\.displayTitle), activeIndex: activeIndex)
         tabBar.isHidden = !tabBarVisible
+        // The tab bar sits in the titlebar strip, which the WindowServer claims
+        // as a window-drag region from outside this process. No view-level
+        // property gets it back — `mouseDownCanMoveWindow` is simply ignored
+        // there — so a press on a tab slides the window instead of the tab.
+        // Clearing `isMovable` is the one thing that stops it. `performDrag` is
+        // unaffected by the flag, so ⌘-drag and the empty strip still move the
+        // window; with a single tab there is no bar and the strip behaves as it
+        // always has.
+        window?.isMovable = !tabBarVisible
         // Lay out now rather than next frame, so a switch never paints one
         // frame of tabs still sitting at their old positions.
         tabBar.layoutSubtreeIfNeeded()
@@ -921,6 +1246,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         tabBar.onSelect = { [weak self] i in self?.selectTab(at: i) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onNewTab = { [weak self] in self?.addTab(url: nil) }
+        tabBar.onReorder = { [weak self] from, to in self?.moveTab(from: from, to: to) }
         tabBar.isHidden = true
         container.addSubview(tabBar)
 
@@ -987,6 +1313,90 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
         profileBadge.addSubview(profileLabel)
         container.addSubview(profileBadge)
+
+        downloadsPanel.onClose = { [weak self] in self?.hideDownloadsPanel() }
+        container.addSubview(downloadsPanel)
+        observeDownloads()
+    }
+
+    // MARK: Downloads panel
+
+    private func observeDownloads() {
+        let center = NotificationCenter.default
+        downloadsObservers = [
+            center.addObserver(forName: .downloadsDidChange, object: nil, queue: .main) {
+                [weak self] _ in self?.downloadsChanged()
+            },
+            center.addObserver(forName: .downloadsMessage, object: nil, queue: .main) {
+                [weak self] note in
+                guard let self, self.window?.isKeyWindow == true,
+                      let text = note.userInfo?["text"] as? String else { return }
+                self.showToast(text)
+            },
+        ]
+    }
+
+    private func downloadsChanged() {
+        downloadsPanel.refresh()
+        layoutOverlays()
+        if downloadManager.hasActiveDownloads {
+            downloadsHide?.cancel()
+            downloadsHide = nil
+        } else if !downloadsPanel.isHidden && !downloadsPanelPinned {
+            scheduleDownloadsHide()
+        }
+    }
+
+    private func showDownloadsPanel(pinned: Bool) {
+        if pinned { downloadsPanelPinned = true }
+        downloadsHide?.cancel()
+        downloadsHide = nil
+        downloadsPanel.refresh()
+        layoutOverlays()
+        guard downloadsPanel.isHidden || downloadsPanel.alphaValue < 1 else { return }
+        downloadsPanel.isHidden = false
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            downloadsPanel.animator().alphaValue = 1
+        }
+    }
+
+    private func hideDownloadsPanel() {
+        downloadsPanelPinned = false
+        downloadsHide?.cancel()
+        downloadsHide = nil
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            self.downloadsPanel.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            guard let self, self.downloadsPanel.alphaValue == 0 else { return }
+            self.downloadsPanel.isHidden = true
+        }
+    }
+
+    // Linger for a moment after the last transfer lands, and keep lingering
+    // while the pointer is still in the panel reaching for Reveal.
+    private func scheduleDownloadsHide() {
+        downloadsHide?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.downloadsPanelPinned,
+                  !downloadManager.hasActiveDownloads else { return }
+            if self.downloadsPanel.pointerInside {
+                self.scheduleDownloadsHide()
+                return
+            }
+            self.hideDownloadsPanel()
+        }
+        downloadsHide = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: work)
+    }
+
+    @objc func toggleDownloadsPanel(_ sender: Any?) {
+        if downloadsPanel.isHidden || downloadsPanel.alphaValue < 1 {
+            showDownloadsPanel(pinned: true)
+        } else {
+            hideDownloadsPanel()
+        }
     }
 
     private func layoutOverlays() {
@@ -1010,6 +1420,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let th: CGFloat = 34
         toastView.frame = NSRect(x: (b.width - tw) / 2, y: 28, width: tw, height: th)
         toastLabel.frame = NSRect(x: 16, y: (th - ts.height) / 2, width: ts.width, height: ts.height)
+
+        // Bottom-right, and never taller than the window leaves room for.
+        let dlW = min(DownloadsPanelView.width, max(240, b.width - 40))
+        let dlH = min(downloadsPanel.preferredHeight, max(120, b.height - barH - 40))
+        downloadsPanel.frame = NSRect(x: b.width - dlW - 20, y: 20, width: dlW, height: dlH)
 
         let profileMaxW = min(180, max(90, b.width * 0.34))
         let profileTextW = min(profileMaxW - 22, profileLabel.intrinsicContentSize.width)
@@ -1265,6 +1680,38 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func showHelpPage(_ sender: Any?) { loadStartPage() }
 
+    // MARK: Ad blocking
+
+    @objc func toggleSiteBlocking(_ sender: Any?) {
+        guard let url = webView.url, let domain = AdBlockManager.domain(for: url) else {
+            showToast("Nothing to allow or block here")
+            return
+        }
+        let blocking = adBlockManager.isBlocking(url)
+        showToast(blocking ? "Ads allowed on \(domain)" : "Blocking ads on \(domain)")
+        adBlockManager.setBlocking(!blocking, for: url) { [weak self] in
+            self?.reloadPage(nil)
+        }
+    }
+
+    @objc func pickElementToBlock(_ sender: Any?) {
+        guard !activeTab.onStartPage, webView.url != nil else {
+            showToast("Open a page first")
+            return
+        }
+        // The script's own return value is undefined, which WebKit reports as an
+        // error; a trailing literal keeps the completion honest about failures
+        // that actually matter.
+        webView.evaluateJavaScript(adBlockPickerScript + "\ntrue;") { [weak self] _, error in
+            guard let error else { return }
+            self?.showToast("Picker failed — \(error.localizedDescription)")
+        }
+    }
+
+    @objc func showAdBlockSettings(_ sender: Any?) {
+        AdBlockSettingsWindowController.shared.present()
+    }
+
     @objc func newTabAction(_ sender: Any?) { addTab(url: nil) }
 
     @objc func closeTabAction(_ sender: Any?) { closeTab(at: activeIndex) }
@@ -1300,6 +1747,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(togglePin(_:)):
             menuItem.state = window?.level == .floating ? .on : .off
             return true
+        case #selector(toggleSiteBlocking(_:)):
+            menuItem.state = adBlockManager.isBlocking(webView.url) ? .on : .off
+            return adBlockManager.settings.enabled && AdBlockManager.domain(for: webView.url) != nil
+        case #selector(pickElementToBlock(_:)):
+            return !activeTab.onStartPage && webView.url != nil
         default: return true
         }
     }
@@ -1314,6 +1766,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
         mouseMonitor = nil
         keyMonitor = nil
+        downloadsHide?.cancel()
+        downloadsHide = nil
+        for observer in downloadsObservers { NotificationCenter.default.removeObserver(observer) }
+        downloadsObservers.removeAll()
+        // Downloads outlive their window on purpose: the manager holds the
+        // delegate, so tearing down these tabs does not stop a transfer.
         for tab in tabs { tab.teardown() }
         onClose?()
     }
@@ -1379,9 +1837,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
         if navigationAction.shouldPerformDownload {
             if launchOptions.snap != nil { exitForSnapDownload() }
+            pendingDownloadWantsPanel = navigationAction.modifierFlags.contains(.option)
             decisionHandler(.download)
             return
         }
+        // Remember the modifier even for links that only turn out to be
+        // downloads once the response headers arrive.
+        pendingDownloadWantsPanel = navigationAction.modifierFlags.contains(.option)
         decisionHandler(.allow)
     }
 
@@ -1398,72 +1860,19 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        beginDownload(download)
+        beginDownload(download, from: webView)
     }
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        beginDownload(download)
+        beginDownload(download, from: webView)
     }
 
-    private func beginDownload(_ download: WKDownload) {
+    private func beginDownload(_ download: WKDownload, from webView: WKWebView) {
         if launchOptions.snap != nil { exitForSnapDownload() }
-        download.delegate = self
-        activeDownloads.insert(ObjectIdentifier(download))
-        showToast("Choose download location")
-    }
-
-    // MARK: WKDownloadDelegate
-
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
-                  suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
-        let name = [suggestedFilename, response.suggestedFilename ?? "", response.url?.lastPathComponent ?? ""]
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty } ?? "download"
-        let panel = NSSavePanel()
-        panel.nameFieldStringValue = name
-        panel.directoryURL = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-        panel.canCreateDirectories = true
-
-        let id = ObjectIdentifier(download)
-        let finish: (NSApplication.ModalResponse) -> Void = { [weak self] result in
-            guard let self else {
-                completionHandler(nil)
-                return
-            }
-            if result == .OK, let url = panel.url {
-                self.showToast("Download started")
-                completionHandler(url)
-            } else {
-                self.activeDownloads.remove(id)
-                self.cancelledDownloads.insert(id)
-                self.showToast("Download cancelled")
-                completionHandler(nil)
-            }
-        }
-
-        if let window {
-            panel.beginSheetModal(for: window, completionHandler: finish)
-        } else {
-            panel.begin(completionHandler: finish)
-        }
-    }
-
-    func downloadDidFinish(_ download: WKDownload) {
-        activeDownloads.remove(ObjectIdentifier(download))
-        showToast("Download complete")
-    }
-
-    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        let id = ObjectIdentifier(download)
-        activeDownloads.remove(id)
-        if cancelledDownloads.remove(id) != nil { return }
-
-        let e = error as NSError
-        if e.code == NSURLErrorCancelled {
-            showToast("Download cancelled")
-        } else {
-            showToast("Download failed")
-        }
+        let wantsPanel = pendingDownloadWantsPanel
+        pendingDownloadWantsPanel = false
+        downloadManager.attach(download, from: webView, wantsSavePanel: wantsPanel)
+        if !wantsPanel { showDownloadsPanel(pinned: false) }
     }
 
     // MARK: WKUIDelegate
@@ -1475,6 +1884,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             if let url = navigationAction.request.url { webView.load(URLRequest(url: url)) }
             return nil
         }
+        // Background opening is not decided here. A middle-click never reaches
+        // this method — the page script cancels it and reports the href instead
+        // — and ⌘-click never reaches the page at all, because `BrowserWebView`
+        // claims ⌘ for dragging the window.
         // Handing back a live web view lets WebKit drive the load itself, so
         // window.open + document.write popups work, not just plain links.
         return addTab(url: nil, configuration: configuration).webView
@@ -1523,6 +1936,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         NSApp.setActivationPolicy(.regular)
         buildMenu()
 
+        // Compiling takes a moment, and the first page can load before the list
+        // is ready. Reloading it out from under the user to catch a handful of
+        // early requests would be worse than missing them.
+        adBlockManager.rebuild()
+        if launchOptions.snap == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                adBlockManager.updateAll(force: false)
+            }
+        }
+
         guard let profile = profileStore.profile(matching: launchOptions.profile) else {
             fputs("chromeless: profile not found: \(launchOptions.profile ?? "")\n", stderr)
             exit(1)
@@ -1560,6 +1983,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     @objc func newWindow(_ sender: Any?) { presentProfilePicker(from: nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // Closing the last window quits the app, so without this a download that is
+    // 90% done dies silently when you close the window it started from.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard downloadManager.hasActiveDownloads, launchOptions.snap == nil else { return .terminateNow }
+        let alert = NSAlert()
+        alert.messageText = "A download is still in progress."
+        alert.informativeText = "Quitting now cancels it."
+        alert.addButton(withTitle: "Quit Anyway")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            downloadManager.cancelAll()
+            return .terminateNow
+        }
+        return .terminateCancel
+    }
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -1797,6 +2236,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                          action: #selector(BrowserWindowController.zoomOutPage(_:)), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Actual Size",
                          action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
+        viewMenu.addItem(.separator())
+        let downloads = viewMenu.addItem(
+            withTitle: "Show Downloads",
+            action: #selector(BrowserWindowController.toggleDownloadsPanel(_:)), keyEquivalent: "j")
+        downloads.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(.separator())
+        let siteBlocking = viewMenu.addItem(
+            withTitle: "Block Ads on This Site",
+            action: #selector(BrowserWindowController.toggleSiteBlocking(_:)), keyEquivalent: "b")
+        siteBlocking.keyEquivalentModifierMask = [.command, .shift]
+        let picker = viewMenu.addItem(
+            withTitle: "Pick Element to Hide…",
+            action: #selector(BrowserWindowController.pickElementToBlock(_:)), keyEquivalent: "e")
+        picker.keyEquivalentModifierMask = [.command, .shift, .control]
+        viewMenu.addItem(withTitle: "Ad Blocking…",
+                         action: #selector(BrowserWindowController.showAdBlockSettings(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let fullScreen = viewMenu.addItem(withTitle: "Enter Full Screen",
                                           action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
