@@ -1957,6 +1957,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                let s = profile.lastURL { return URL(string: s) }
             return nil
         }()
+        // A URL opened from another app (`open -a Chromeless <url>`, a link
+        // clicked somewhere else) arrives through application(_:open:), which
+        // AppKit calls *before* this method, so a window is already up. Opening
+        // the start page as well used to bury it: the link looked like it had
+        // been swallowed, when it was loading one window behind.
+        if url == nil && launchOptions.snap == nil && !controllers.isEmpty {
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
         openWindow(profile: profile, url: url, size: launchOptions.size, snap: launchOptions.snap, isPrimary: true)
         NSApp.activate(ignoringOtherApps: true)
 
