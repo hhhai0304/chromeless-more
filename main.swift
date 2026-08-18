@@ -397,7 +397,7 @@ private let startPageTemplate = #"""
          animation: in .6s ease-out; }
   @keyframes in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
   h1 { font-size: 46px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 6px; color: #fff; }
-  p.tag { color: #85858f; margin: 0 0 40px; font-size: 16px; }
+  p.tag { color: #85858f; margin: 0 0 46px; font-size: 16px; }
   .keys { display: grid; grid-template-columns: auto auto; gap: 11px 22px;
           justify-content: center; text-align: left; font-size: 13.5px; color: #b9b9c4; }
   .k { text-align: right; }
@@ -407,24 +407,33 @@ private let startPageTemplate = #"""
   footer { margin-top: 44px; color: #55555e; font-size: 12px; line-height: 2; }
   footer b { color: #8a8a97; font-weight: 600; }
 
-  /* Quick access */
-  .qa { display: grid; grid-template-columns: repeat(5, 104px); gap: 14px;
-        justify-content: center; margin: 0 0 44px; }
-  .slot { position: relative; height: 94px; border-radius: 14px; display: flex;
-          flex-direction: column; align-items: center; justify-content: center; gap: 9px;
-          background: #131319; border: 1px solid #22222c; cursor: pointer;
+  /* Quick access — a footnote under the keys, not a headline above them. */
+  .qa { margin: 36px 0 0; }
+  .qa-head { display: inline-flex; align-items: center; gap: 7px; padding: 3px 9px;
+             border: 0; border-radius: 7px; background: none; cursor: pointer;
+             font: 11.5px -apple-system, system-ui; letter-spacing: .04em; color: #55555e; }
+  .qa-head:hover { background: #14141a; color: #8a8a97; }
+  .chev { font-size: 9px; transform: rotate(90deg); transition: transform .15s; }
+  .qa[data-collapsed] .chev { transform: rotate(0deg); }
+  .qa[data-collapsed] .grid { display: none; }
+  .count { color: #3b3b45; }
+  .grid { display: grid; grid-template-columns: repeat(5, 76px); gap: 10px;
+          justify-content: center; margin: 13px 0 0; }
+  .slot { position: relative; height: 66px; border-radius: 11px; display: flex;
+          flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+          background: #121218; border: 1px solid #1f1f28; cursor: pointer;
           transition: background .12s, border-color .12s, transform .12s; }
-  .slot:hover { background: #191921; border-color: #34343f; transform: translateY(-1px); }
-  .slot img, .mono { width: 34px; height: 34px; border-radius: 8px; }
-  .mono { display: grid; place-items: center; background: #262632; color: #cfcfdb;
-          font: 600 16px -apple-system, system-ui; text-transform: uppercase; }
-  .name { max-width: 86px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-          font-size: 12px; color: #b9b9c4; }
-  .empty { background: none; border: 1px dashed #23232d; color: #35353f; font-size: 21px;
+  .slot:hover { background: #181820; border-color: #31313c; transform: translateY(-1px); }
+  .slot img, .mono { width: 24px; height: 24px; border-radius: 6px; }
+  .mono { display: grid; place-items: center; background: #24242f; color: #cfcfdb;
+          font: 600 12px -apple-system, system-ui; text-transform: uppercase; }
+  .name { max-width: 62px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+          font-size: 10.5px; color: #9a9aa6; }
+  .empty { background: none; border: 1px dashed #21212a; color: #313139; font-size: 16px;
            font-weight: 300; }
-  .empty:hover { background: none; border-color: #3f3f4d; color: #74748a; }
-  .pen { position: absolute; top: 5px; right: 5px; width: 21px; height: 21px; border-radius: 7px;
-         display: grid; place-items: center; font-size: 11px; color: #8a8a97; background: #24242e;
+  .empty:hover { background: none; border-color: #3a3a47; color: #6c6c80; }
+  .pen { position: absolute; top: 3px; right: 3px; width: 17px; height: 17px; border-radius: 6px;
+         display: grid; place-items: center; font-size: 9px; color: #8a8a97; background: #24242e;
          opacity: 0; transition: opacity .12s; }
   .slot:hover .pen { opacity: 1; }
   .pen:hover { background: #353542; color: #fff; }
@@ -458,7 +467,6 @@ private let startPageTemplate = #"""
 <body><main>
   <h1>chromeless</h1>
   <p class="tag">the browser that isn&rsquo;t there</p>
-  <div class="qa" id="qa"></div>
   <div class="keys">
     <div class="k"><kbd>&#8984; L</kbd></div>       <div>search or enter a url</div>
     <div class="k"><kbd>&#8984; T</kbd></div>       <div>new tab &mdash; the tab bar shows up from the second one</div>
@@ -475,6 +483,12 @@ private let startPageTemplate = #"""
     <div class="k"><kbd>&#8679;&#8984; B</kbd></div><div>ads are blocked everywhere &mdash; this lets them through on one site</div>
     <div class="k"><kbd>&#8963;&#8679;&#8984; E</kbd></div><div>point at anything on the page and hide it for good</div>
   </div>
+  <section class="qa" id="qa">
+    <button type="button" class="qa-head" id="qa-head" aria-expanded="true">
+      <span class="chev">&#9656;</span> quick access <span class="count" id="qa-count"></span>
+    </button>
+    <div class="grid" id="qa-grid"></div>
+  </section>
   <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
   <br>quick access: click a tile to go, &#8984;-click for a background tab, &#9998; to edit &mdash; icons fetch themselves
   <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b></footer>
@@ -499,7 +513,10 @@ private let startPageTemplate = #"""
 <script>
 (function () {
   var state = __QUICK_ACCESS__;
-  var grid = document.getElementById("qa");
+  var section = document.getElementById("qa");
+  var head = document.getElementById("qa-head");
+  var count = document.getElementById("qa-count");
+  var grid = document.getElementById("qa-grid");
   var sheet = document.getElementById("sheet");
   var form = document.getElementById("form");
   var heading = document.getElementById("heading");
@@ -578,7 +595,23 @@ private let startPageTemplate = #"""
     // One trailing "+" only — a wall of empty boxes is louder than the page
     // it is sitting on.
     if (links.length < state.slots) grid.appendChild(blank());
+    // The count is what the section has left to say once it is folded shut.
+    count.textContent = links.length ? String(links.length) : "";
+    collapse(state.collapsed === true);
   }
+
+  function collapse(shut) {
+    if (shut) section.setAttribute("data-collapsed", "");
+    else section.removeAttribute("data-collapsed");
+    head.setAttribute("aria-expanded", shut ? "false" : "true");
+  }
+
+  head.addEventListener("click", function () {
+    var shut = !section.hasAttribute("data-collapsed");
+    collapse(shut);
+    state.collapsed = shut;
+    post({ action: "collapse", value: shut });
+  });
 
   function openSheet(link) {
     editingID = link ? link.id : null;
@@ -1805,6 +1838,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case "remove":
             guard let id = body["id"] as? String else { return }
             quickAccessStore.remove(id: id)
+
+        // Folded or unfolded is remembered, since the start page is rebuilt
+        // from scratch every time it is opened.
+        case "collapse":
+            quickAccessStore.setCollapsed(body["value"] as? Bool == true)
 
         case "editing":
             // The HUD floats over the page and holds first responder, so it has

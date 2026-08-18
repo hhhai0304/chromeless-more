@@ -47,15 +47,17 @@ Downloads use the native macOS save panel when a page requests a download or Web
 
 ## Quick access
 
-The start page holds up to ten shortcuts. Click the dashed `+` to add one: type
-an address, optionally a name, and save. Chromeless then goes and fetches the
+A small strip of up to ten shortcuts sits under the key list at the bottom of
+the start page. Click `quick access` to fold it away — the page remembers, so it
+stays folded until you open it again. Click the dashed `+` to add a shortcut:
+type an address, optionally a name, and save. Chromeless then goes and fetches the
 site's own icon — and its title, if the name was left blank — so nothing has to
 be pasted in by hand. A shortcut saved offline picks its icon up on a later
 launch.
 
 Click a tile to open it in the current tab, `⌘`-click or middle-click for a
-background tab, and hover the `✎` to edit or remove. Shortcuts are shared by
-every profile and stored at:
+background tab, and hover the `✎` to edit or remove. Shortcuts (and whether the
+strip is folded) are shared by every profile and stored at:
 
 ```text
 ~/Library/Application Support/Chromeless/quickaccess.json

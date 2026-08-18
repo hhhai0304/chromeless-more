@@ -24,6 +24,9 @@ struct QuickLink: Codable, Equatable {
 
 struct QuickAccessArchive: Codable {
     var links: [QuickLink]
+    /// Optional so a file written before the section could be folded still
+    /// decodes; a missing key just means "open".
+    var collapsed: Bool?
 }
 
 final class QuickAccessStore {
@@ -31,6 +34,7 @@ final class QuickAccessStore {
     static let slotCount = 10
 
     private(set) var links: [QuickLink] = []
+    private(set) var collapsed = false
     private let directoryURL: URL
     private let fileURL: URL
 
@@ -50,9 +54,11 @@ final class QuickAccessStore {
             if let icon = link.icon { item["icon"] = icon }
             return item
         }
-        let payload: [String: Any] = ["slots": Self.slotCount, "links": items]
+        let payload: [String: Any] = ["slots": Self.slotCount, "links": items, "collapsed": collapsed]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: data, encoding: .utf8) else { return "{\"slots\":\(Self.slotCount),\"links\":[]}" }
+              let json = String(data: data, encoding: .utf8) else {
+            return "{\"slots\":\(Self.slotCount),\"links\":[],\"collapsed\":false}"
+        }
         // Titles come off arbitrary web pages and this JSON is pasted inside a
         // <script> tag, so no character that could close it survives the trip.
         return json
@@ -92,6 +98,12 @@ final class QuickAccessStore {
         persist()
         refreshIcon(for: link, keepTitle: !cleanTitle.isEmpty)
         return link
+    }
+
+    func setCollapsed(_ value: Bool) {
+        guard collapsed != value else { return }
+        collapsed = value
+        persist()
     }
 
     func remove(id: String) {
@@ -138,7 +150,9 @@ final class QuickAccessStore {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
             let data = try Data(contentsOf: fileURL)
-            links = try JSONDecoder().decode(QuickAccessArchive.self, from: data).links
+            let archive = try JSONDecoder().decode(QuickAccessArchive.self, from: data)
+            links = archive.links
+            collapsed = archive.collapsed ?? false
             if links.count > Self.slotCount { links.removeSubrange(Self.slotCount...) }
         } catch {
             fputs("chromeless: could not load quick access: \(error.localizedDescription)\n", stderr)
@@ -150,7 +164,8 @@ final class QuickAccessStore {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(QuickAccessArchive(links: links)).write(to: fileURL, options: .atomic)
+            try encoder.encode(QuickAccessArchive(links: links, collapsed: collapsed))
+                .write(to: fileURL, options: .atomic)
         } catch {
             fputs("chromeless: could not save quick access: \(error.localizedDescription)\n", stderr)
         }
