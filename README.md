@@ -30,7 +30,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⇧⌘S` | Snapshot the page as PNG → Desktop |
 | `⌘P` | Pin the window above everything |
 | `⌘[` / `⌘]` | Back / forward (two-finger swipe also works) |
-| `Esc` | Bail out — back to the start page (`⌘[` returns) |
+| `⇧⌘H` | Home — back to the start page |
 | `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) |
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
@@ -44,6 +44,25 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
 Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
+
+## Quick access
+
+The start page holds up to ten shortcuts. Click the dashed `+` to add one: type
+an address, optionally a name, and save. Chromeless then goes and fetches the
+site's own icon — and its title, if the name was left blank — so nothing has to
+be pasted in by hand. A shortcut saved offline picks its icon up on a later
+launch.
+
+Click a tile to open it in the current tab, `⌘`-click or middle-click for a
+background tab, and hover the `✎` to edit or remove. Shortcuts are shared by
+every profile and stored at:
+
+```text
+~/Library/Application Support/Chromeless/quickaccess.json
+```
+
+Icons live in that file as 64pt base64 PNGs, because the start page is handed to
+WebKit as a string with no base URL and so has no origin to load an image from.
 
 ## Tabs
 

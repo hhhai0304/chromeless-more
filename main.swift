@@ -379,7 +379,10 @@ if launchOptions.listProfiles {
 
 // MARK: - Start page
 
-let startPageHTML = """
+// The page is handed to WebKit as a bare string with no base URL, so it cannot
+// pull in a stylesheet, a script, or an image file — everything it needs is
+// inline, and the quick-access icons ride along as base64 data URIs.
+private let startPageTemplate = #"""
 <!doctype html>
 <html><head><meta charset="utf-8"><title>chromeless</title>
 <style>
@@ -394,7 +397,7 @@ let startPageHTML = """
          animation: in .6s ease-out; }
   @keyframes in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; } }
   h1 { font-size: 46px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 6px; color: #fff; }
-  p.tag { color: #85858f; margin: 0 0 46px; font-size: 16px; }
+  p.tag { color: #85858f; margin: 0 0 40px; font-size: 16px; }
   .keys { display: grid; grid-template-columns: auto auto; gap: 11px 22px;
           justify-content: center; text-align: left; font-size: 13.5px; color: #b9b9c4; }
   .k { text-align: right; }
@@ -403,10 +406,59 @@ let startPageHTML = """
         padding: 2.5px 8px; color: #e8e8ee; white-space: nowrap; }
   footer { margin-top: 44px; color: #55555e; font-size: 12px; line-height: 2; }
   footer b { color: #8a8a97; font-weight: 600; }
+
+  /* Quick access */
+  .qa { display: grid; grid-template-columns: repeat(5, 104px); gap: 14px;
+        justify-content: center; margin: 0 0 44px; }
+  .slot { position: relative; height: 94px; border-radius: 14px; display: flex;
+          flex-direction: column; align-items: center; justify-content: center; gap: 9px;
+          background: #131319; border: 1px solid #22222c; cursor: pointer;
+          transition: background .12s, border-color .12s, transform .12s; }
+  .slot:hover { background: #191921; border-color: #34343f; transform: translateY(-1px); }
+  .slot img, .mono { width: 34px; height: 34px; border-radius: 8px; }
+  .mono { display: grid; place-items: center; background: #262632; color: #cfcfdb;
+          font: 600 16px -apple-system, system-ui; text-transform: uppercase; }
+  .name { max-width: 86px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+          font-size: 12px; color: #b9b9c4; }
+  .empty { background: none; border: 1px dashed #23232d; color: #35353f; font-size: 21px;
+           font-weight: 300; }
+  .empty:hover { background: none; border-color: #3f3f4d; color: #74748a; }
+  .pen { position: absolute; top: 5px; right: 5px; width: 21px; height: 21px; border-radius: 7px;
+         display: grid; place-items: center; font-size: 11px; color: #8a8a97; background: #24242e;
+         opacity: 0; transition: opacity .12s; }
+  .slot:hover .pen { opacity: 1; }
+  .pen:hover { background: #353542; color: #fff; }
+
+  /* Add / edit sheet */
+  .sheet { position: fixed; inset: 0; background: #05050880; backdrop-filter: blur(6px);
+           display: none; place-items: center; z-index: 10; }
+  .sheet[data-open] { display: grid; }
+  .card { width: 340px; text-align: left; background: #16161d; border: 1px solid #2c2c36;
+          border-radius: 16px; padding: 22px; box-shadow: 0 24px 60px #00000080; }
+  .card h2 { margin: 0 0 16px; font-size: 16px; font-weight: 600; color: #fff; }
+  .card label { display: block; font-size: 11.5px; color: #7c7c88; margin: 0 0 4px;
+                text-transform: uppercase; letter-spacing: .05em; }
+  .card input { width: 100%; box-sizing: border-box; margin: 0 0 14px; padding: 9px 11px;
+                background: #0e0e13; border: 1px solid #2c2c36; border-radius: 9px;
+                color: #e8e8ee; font: 13.5px -apple-system, system-ui; outline: none;
+                -webkit-user-select: text; cursor: text; }
+  .card input:focus { border-color: #4a4a5c; }
+  .err { min-height: 16px; margin: -8px 0 10px; font-size: 12px; color: #e2686f; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row .spacer { flex: 1; }
+  .card button { padding: 7px 14px; border-radius: 9px; border: 1px solid #2c2c36;
+                 background: #1e1e26; color: #d8d8e2; font: 13px -apple-system, system-ui;
+                 cursor: pointer; }
+  .card button:hover { background: #26262f; }
+  .card button.save { background: #3a6df0; border-color: #3a6df0; color: #fff; }
+  .card button.save:hover { background: #4a7bf5; }
+  .card button.drop { border-color: transparent; background: none; color: #98545a; }
+  .card button.drop:hover { background: #2a1a1d; color: #e2686f; }
 </style></head>
 <body><main>
   <h1>chromeless</h1>
   <p class="tag">the browser that isn&rsquo;t there</p>
+  <div class="qa" id="qa"></div>
   <div class="keys">
     <div class="k"><kbd>&#8984; L</kbd></div>       <div>search or enter a url</div>
     <div class="k"><kbd>&#8984; T</kbd></div>       <div>new tab &mdash; the tab bar shows up from the second one</div>
@@ -417,40 +469,193 @@ let startPageHTML = """
     <div class="k"><kbd>&#8679;&#8984; S</kbd></div><div>snapshot the page &rarr; desktop</div>
     <div class="k"><kbd>&#8984; P</kbd></div>       <div>pin on top of every window</div>
     <div class="k"><kbd>&#8984; [</kbd> <kbd>&#8984; ]</kbd></div><div>back / forward</div>
-    <div class="k"><kbd>esc</kbd></div>             <div>bail out &mdash; back to this page</div>
+    <div class="k"><kbd>&#8679;&#8984; H</kbd></div><div>home &mdash; back to this page</div>
     <div class="k"><kbd>&#8984; =</kbd> <kbd>&#8984; &minus;</kbd> <kbd>&#8984; 0</kbd></div><div>zoom</div>
     <div class="k"><kbd>&#8679;&#8984; C</kbd></div><div>copy current url</div>
     <div class="k"><kbd>&#8679;&#8984; B</kbd></div><div>ads are blocked everywhere &mdash; this lets them through on one site</div>
     <div class="k"><kbd>&#8963;&#8679;&#8984; E</kbd></div><div>point at anything on the page and hide it for good</div>
   </div>
   <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
+  <br>quick access: click a tile to go, &#8984;-click for a background tab, &#9998; to edit &mdash; icons fetch themselves
   <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b></footer>
-</main></body></html>
-"""
+</main>
+
+<div class="sheet" id="sheet">
+  <form class="card" id="form">
+    <h2 id="heading">Add a shortcut</h2>
+    <label for="url">Address</label>
+    <input id="url" placeholder="example.com" spellcheck="false" autocapitalize="off">
+    <label for="title">Name</label>
+    <input id="title" maxlength="60" placeholder="Taken from the site if left blank">
+    <p class="err" id="err"></p>
+    <div class="row">
+      <button type="button" class="drop" id="drop" hidden>Remove</button>
+      <span class="spacer"></span>
+      <button type="button" id="cancel">Cancel</button>
+      <button type="submit" class="save">Save</button>
+    </div>
+  </form>
+</div>
+<script>
+(function () {
+  var state = __QUICK_ACCESS__;
+  var grid = document.getElementById("qa");
+  var sheet = document.getElementById("sheet");
+  var form = document.getElementById("form");
+  var heading = document.getElementById("heading");
+  var urlField = document.getElementById("url");
+  var titleField = document.getElementById("title");
+  var errLine = document.getElementById("err");
+  var dropButton = document.getElementById("drop");
+  var editingID = null;
+
+  function post(message) {
+    try { window.webkit.messageHandlers.chromelessQuickAccess.postMessage(message); } catch (e) {}
+  }
+
+  function initial(link) {
+    var source = (link.title || link.url.replace(/^[a-z]+:\/\/(www\.)?/i, "")).trim();
+    return source ? source.charAt(0) : "?";
+  }
+
+  // Built node by node rather than with innerHTML: a page title is arbitrary
+  // text off the internet, and textContent is the one place it cannot bite.
+  function tile(link) {
+    var slot = document.createElement("div");
+    slot.className = "slot";
+    slot.title = link.url;
+
+    var art;
+    if (link.icon) {
+      art = document.createElement("img");
+      art.src = link.icon;
+      art.alt = "";
+    } else {
+      art = document.createElement("div");
+      art.className = "mono";
+      art.textContent = initial(link);
+    }
+    slot.appendChild(art);
+
+    var name = document.createElement("div");
+    name.className = "name";
+    name.textContent = link.title || link.url;
+    slot.appendChild(name);
+
+    var pen = document.createElement("div");
+    pen.className = "pen";
+    pen.textContent = "✎";
+    pen.addEventListener("click", function (event) {
+      event.stopPropagation();
+      openSheet(link);
+    });
+    slot.appendChild(pen);
+
+    slot.addEventListener("click", function (event) {
+      post({ action: "open", id: link.id, background: event.metaKey === true, activate: event.shiftKey === true });
+    });
+    slot.addEventListener("auxclick", function (event) {
+      if (event.button !== 1) return;
+      event.preventDefault();
+      post({ action: "open", id: link.id, background: true, activate: event.shiftKey === true });
+    });
+    return slot;
+  }
+
+  function blank() {
+    var slot = document.createElement("div");
+    slot.className = "slot empty";
+    slot.textContent = "+";
+    slot.addEventListener("click", function () { openSheet(null); });
+    return slot;
+  }
+
+  function render(next) {
+    if (next) state = next;
+    grid.textContent = "";
+    var links = state.links || [];
+    for (var i = 0; i < links.length; i++) grid.appendChild(tile(links[i]));
+    // One trailing "+" only — a wall of empty boxes is louder than the page
+    // it is sitting on.
+    if (links.length < state.slots) grid.appendChild(blank());
+  }
+
+  function openSheet(link) {
+    editingID = link ? link.id : null;
+    heading.textContent = link ? "Edit shortcut" : "Add a shortcut";
+    urlField.value = link ? link.url : "";
+    titleField.value = link ? link.title : "";
+    errLine.textContent = "";
+    dropButton.hidden = !link;
+    sheet.setAttribute("data-open", "");
+    // The ⌘L HUD owns the keyboard while the start page is up; ask for it back,
+    // then take focus once its dismissal animation has finished.
+    post({ action: "editing", value: true });
+    urlField.focus();
+    setTimeout(function () { urlField.focus(); urlField.select(); }, 240);
+  }
+
+  function closeSheet() {
+    sheet.removeAttribute("data-open");
+    editingID = null;
+    post({ action: "editing", value: false });
+  }
+
+  // The sheet is left open here on purpose — the app has the last word on
+  // whether the address is usable, and it answers with accept() or reject().
+  form.addEventListener("submit", function (event) {
+    event.preventDefault();
+    var address = urlField.value.trim();
+    if (!address) { errLine.textContent = "An address is required."; urlField.focus(); return; }
+    errLine.textContent = "";
+    post({ action: "save", id: editingID, url: address, title: titleField.value.trim() });
+  });
+  document.getElementById("cancel").addEventListener("click", closeSheet);
+  dropButton.addEventListener("click", function () {
+    if (editingID) post({ action: "remove", id: editingID });
+    closeSheet();
+  });
+  sheet.addEventListener("click", function (event) { if (event.target === sheet) closeSheet(); });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && sheet.hasAttribute("data-open")) {
+      event.preventDefault();
+      closeSheet();
+    }
+  });
+
+  window.chromelessQuickAccess = {
+    render: render,
+    // The app skips a refresh while the sheet is up, so an icon landing
+    // mid-edit cannot wipe out what is being typed.
+    isEditing: function () { return sheet.hasAttribute("data-open"); },
+    // The shortcut is saved: shut the sheet, then ask for the repaint that was
+    // skipped for exactly that reason a moment ago.
+    accept: function () { closeSheet(); post({ action: "ready" }); },
+    reject: function (text) { errLine.textContent = text; urlField.focus(); }
+  };
+  render(null);
+})();
+</script>
+</body></html>
+"""#
+
+func startPageHTML() -> String {
+    startPageTemplate.replacingOccurrences(of: "__QUICK_ACCESS__", with: quickAccessStore.payloadJSON)
+}
 
 // MARK: - Views
 
 final class BrowserWebView: WKWebView {
-    // Bare Esc escapes back to the start page — unless fullscreen needs it,
-    // or the ⌘L HUD is open (its field is first responder and handles Esc itself).
-    var onEscape: (() -> Bool)?
     // Set by the owning window controller. Fed by `AuxClickRouter` for a
     // middle-click, and by `openLinkInNewTab` for a ⌘-click.
     var onOpenLinkInNewTab: ((URL, _ background: Bool) -> Void)?
     // Fed by `AdBlockPickerRouter` once the element picker has a selector, or
     // nil when the element could not be named safely.
     var onPickedSelector: ((String?) -> Void)?
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53, // Esc
-           event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
-           window?.styleMask.contains(.fullScreen) != true,
-           fullscreenState == .notInFullscreen,
-           onEscape?() == true {
-            return
-        }
-        super.keyDown(with: event)
-    }
+    // Fed by `QuickAccessRouter` when the start page opens, saves, or drops a
+    // shortcut. Bare Esc deliberately does nothing here: it used to jump back
+    // to the start page, which threw away whatever was typed into the page.
+    var onQuickAccess: ((BrowserWebView, [String: Any]) -> Void)?
 
     // ⌘ is overloaded: ⌘-drag moves the window, ⌘-click opens the link under
     // the cursor in a new tab. Which one it is is not knowable at mouse-down,
@@ -601,6 +806,7 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
     conf.userContentController.add(AuxClickRouter.shared, name: AuxClickRouter.messageName)
     conf.userContentController.add(AdBlockPickerRouter.shared, name: AdBlockPickerRouter.messageName)
+    conf.userContentController.add(QuickAccessRouter.shared, name: QuickAccessRouter.messageName)
     conf.userContentController.addUserScript(WKUserScript(
         source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
     if !hasPasskeyEntitlement {
@@ -1002,6 +1208,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var downloadsPanelPinned = false
     private var downloadsHide: DispatchWorkItem?
     private var downloadsObservers: [NSObjectProtocol] = []
+    private var quickAccessObserver: NSObjectProtocol?
     // ⌥ is read when the navigation is still an action, because a response
     // download arrives a round trip later, by which time the key is released.
     private var pendingDownloadWantsPanel = false
@@ -1080,7 +1287,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private func configure(_ tab: Tab) {
         let wv = tab.webView
         wv.autoresizingMask = [.width, .height]
-        wv.onEscape = { [weak self] in self?.escapeToStart() ?? false }
+        wv.onQuickAccess = { [weak self] source, body in self?.handleQuickAccess(body, from: source) }
         wv.onOpenLinkInNewTab = { [weak self] url, background in
             _ = self?.addTab(url: url, activate: !background)
         }
@@ -1317,6 +1524,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         downloadsPanel.onClose = { [weak self] in self?.hideDownloadsPanel() }
         container.addSubview(downloadsPanel)
         observeDownloads()
+        observeQuickAccess()
     }
 
     // MARK: Downloads panel
@@ -1517,7 +1725,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func loadStartPage(in tab: Tab) {
         tab.onStartPage = true
-        tab.webView.loadHTMLString(startPageHTML, baseURL: nil)
+        tab.webView.loadHTMLString(startPageHTML(), baseURL: nil)
         tabBar.update(titleAt: tabs.firstIndex { $0 === tab }, to: tab.displayTitle)
     }
 
@@ -1533,10 +1741,85 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
-    private func escapeToStart() -> Bool {
-        if activeTab.onStartPage { return false }
-        loadStartPage(in: activeTab)
-        return true
+    // MARK: Quick access
+
+    private func observeQuickAccess() {
+        quickAccessObserver = NotificationCenter.default.addObserver(
+            forName: .quickAccessDidChange, object: nil, queue: .main) { [weak self] _ in
+                self?.refreshQuickAccess()
+            }
+    }
+
+    // Every start page in the window is repainted, not just the front one, and
+    // every other window does the same off the notification — a shortcut saved
+    // here has to exist everywhere it is on screen. The sheet being open is the
+    // one exception: an icon arriving mid-edit must not blow away the typing.
+    private func refreshQuickAccess() {
+        for tab in tabs where tab.onStartPage { render(into: tab.webView) }
+    }
+
+    private func render(into webView: BrowserWebView) {
+        webView.evaluateJavaScript("""
+        (function () {
+          var qa = window.chromelessQuickAccess;
+          if (qa && !qa.isEditing()) qa.render(\(quickAccessStore.payloadJSON));
+        })();
+        """)
+    }
+
+    /// Calls one method on the start page's bridge, and does nothing at all if
+    /// the page in that view has since been navigated away from.
+    private func reply(to webView: BrowserWebView, _ call: String) {
+        webView.evaluateJavaScript(
+            "window.chromelessQuickAccess && window.chromelessQuickAccess.\(call);")
+    }
+
+    private func handleQuickAccess(_ body: [String: Any], from webView: BrowserWebView) {
+        switch body["action"] as? String {
+        case "open":
+            guard let id = body["id"] as? String,
+                  let link = quickAccessStore.link(id: id),
+                  let url = URL(string: link.url) else { return }
+            if body["background"] as? Bool == true {
+                addTab(url: url, activate: body["activate"] as? Bool == true)
+            } else {
+                guard let tab = tab(for: webView) else { return }
+                load(url, in: tab)
+            }
+
+        // The sheet stays open until this comes back, so a rejected address can
+        // be corrected instead of being silently swallowed.
+        case "save":
+            let raw = (body["url"] as? String) ?? ""
+            guard let url = smartURL(raw), !url.isFileURL else {
+                reply(to: webView, "reject('That address doesn\\'t look right.')")
+                return
+            }
+            let id = body["id"] as? String
+            guard quickAccessStore.save(id: id, title: (body["title"] as? String) ?? "", url: url) != nil else {
+                reply(to: webView, "reject('All \(QuickAccessStore.slotCount) slots are taken.')")
+                return
+            }
+            reply(to: webView, "accept()")
+
+        case "remove":
+            guard let id = body["id"] as? String else { return }
+            quickAccessStore.remove(id: id)
+
+        case "editing":
+            // The HUD floats over the page and holds first responder, so it has
+            // to get out of the way before the sheet can be typed into.
+            if body["value"] as? Bool == true { hideHUD() }
+
+        // Sent by the page once its sheet is shut. `refreshQuickAccess` skipped
+        // this tab while the sheet was open, so this is the repaint it missed.
+        case "ready":
+            guard let tab = tab(for: webView), tab.onStartPage else { return }
+            render(into: webView)
+
+        default:
+            break
+        }
     }
 
     // MARK: HUD (the ⌘L address bar)
@@ -1680,6 +1963,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func showHelpPage(_ sender: Any?) { loadStartPage() }
 
+    @objc func goHome(_ sender: Any?) { loadStartPage() }
+
     // MARK: Ad blocking
 
     @objc func toggleSiteBlocking(_ sender: Any?) {
@@ -1770,6 +2055,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         downloadsHide = nil
         for observer in downloadsObservers { NotificationCenter.default.removeObserver(observer) }
         downloadsObservers.removeAll()
+        if let observer = quickAccessObserver { NotificationCenter.default.removeObserver(observer) }
+        quickAccessObserver = nil
         // Downloads outlive their window on purpose: the manager holds the
         // delegate, so tearing down these tabs does not stop a transfer.
         for tab in tabs { tab.teardown() }
@@ -1944,6 +2231,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
                 adBlockManager.updateAll(force: false)
             }
+            // A shortcut saved while the machine was offline still has no icon.
+            quickAccessStore.refreshMissingIcons()
         }
 
         guard let profile = profileStore.profile(matching: launchOptions.profile) else {
@@ -2236,6 +2525,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                          action: #selector(BrowserWindowController.zoomOutPage(_:)), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "Actual Size",
                          action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
+        viewMenu.addItem(.separator())
+        let home = viewMenu.addItem(withTitle: "Home",
+                                    action: #selector(BrowserWindowController.goHome(_:)), keyEquivalent: "h")
+        home.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         let downloads = viewMenu.addItem(
             withTitle: "Show Downloads",
