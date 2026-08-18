@@ -2286,6 +2286,56 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         alert.addButton(withTitle: "Cancel")
         completionHandler(alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil)
     }
+
+    // WebKit owns no file chooser of its own: without this method a click on
+    // <input type="file"> does nothing at all — no panel, no error, no console
+    // message. The completion handler must run exactly once, or the input stays
+    // wedged for the rest of the page's life and never asks again.
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters,
+                 initiatedByFrame frame: WKFrameInfo,
+                 completionHandler: @escaping ([URL]?) -> Void) {
+        var answered = false
+        let reply: ([URL]?) -> Void = { urls in
+            guard !answered else { return }
+            answered = true
+            completionHandler(urls)
+        }
+
+        // --snap is a one-shot screenshot; stopping for a panel would hang it.
+        guard launchOptions.snap == nil else {
+            reply(nil)
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+        // `webkitdirectory` asks for a folder, and WebKit walks it itself. The
+        // two modes are exclusive: offering both lets the page get a kind of
+        // path it never asked for.
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.canChooseFiles = !parameters.allowsDirectories
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+        panel.treatsFilePackagesAsDirectories = false
+        panel.prompt = parameters.allowsDirectories ? "Choose Folder" : "Choose"
+        // No type filter: `accept` is not exposed on WKOpenPanelParameters, and
+        // guessing it from the page would only make valid files unselectable.
+        if let host = frame.request.url?.host ?? webView.url?.host {
+            panel.message = "Choose \(parameters.allowsDirectories ? "a folder" : "files") to upload to \(host)"
+        }
+
+        // The ⌘L HUD floats inside the window and would sit under the sheet.
+        hideHUD()
+
+        let finish: (NSApplication.ModalResponse) -> Void = { result in
+            reply(result == .OK && !panel.urls.isEmpty ? panel.urls : nil)
+        }
+        if let window = webView.window ?? self.window {
+            panel.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            panel.begin(completionHandler: finish)
+        }
+    }
 }
 
 // MARK: - App delegate

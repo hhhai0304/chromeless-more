@@ -44,6 +44,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
 Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
+File uploads use the native open panel: clicking an `<input type="file">` opens it as a sheet, honouring `multiple` and `webkitdirectory`. Dragging files onto the page works too.
 
 ## Quick access
 
