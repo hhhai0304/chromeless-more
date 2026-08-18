@@ -1468,10 +1468,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
-    // ⌃Tab cannot be a menu key equivalent on macOS, so it is caught here.
+    // ⌃Tab cannot be a menu key equivalent on macOS, so it is caught here —
+    // and F12 lives here too, so the menu can advertise the Mac-native ⌥⌘I
+    // while the Chrome/Windows reflex still works.
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
+            if event.keyCode == 111, !event.modifierFlags.contains(.command) {
+                self.toggleWebInspector(nil)
+                return nil
+            }
             guard event.modifierFlags.contains(.control), event.keyCode == 48 else { return event }
             if event.modifierFlags.contains(.shift) {
                 self.showPreviousTab(nil)
@@ -1962,6 +1968,35 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if activeTab.onStartPage { loadStartPage() } else { webView.reloadFromOrigin() }
     }
 
+    // WebKit exposes no public way to open the inspector — `isInspectable`
+    // only unlocks it for Safari's Develop menu and the context menu. The
+    // private `_inspector` handle is what Safari itself drives; every hop is
+    // guarded so a rename in a future macOS degrades to a toast, not a crash.
+    @objc func toggleWebInspector(_ sender: Any?) {
+        guard let inspector = webInspector else {
+            showToast("Web Inspector unavailable")
+            return
+        }
+        let action = NSSelectorFromString(isWebInspectorVisible ? "hide" : "show")
+        guard inspector.responds(to: action) else {
+            showToast("Web Inspector unavailable")
+            return
+        }
+        _ = inspector.perform(action)
+    }
+
+    private var webInspector: NSObject? {
+        let sel = NSSelectorFromString("_inspector")
+        guard webView.responds(to: sel) else { return nil }
+        return webView.perform(sel)?.takeUnretainedValue() as? NSObject
+    }
+
+    private var isWebInspectorVisible: Bool {
+        let sel = NSSelectorFromString("isVisible")
+        guard let inspector = webInspector, inspector.responds(to: sel) else { return false }
+        return (inspector.value(forKey: "isVisible") as? Bool) ?? false
+    }
+
     @objc func goBackAction(_ sender: Any?) { webView.goBack() }
     @objc func goForwardAction(_ sender: Any?) { webView.goForward() }
 
@@ -2075,6 +2110,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             return adBlockManager.settings.enabled && AdBlockManager.domain(for: webView.url) != nil
         case #selector(pickElementToBlock(_:)):
             return !activeTab.onStartPage && webView.url != nil
+        case #selector(toggleWebInspector(_:)):
+            menuItem.title = isWebInspectorVisible ? "Hide Web Inspector" : "Show Web Inspector"
+            return webInspector != nil
         default: return true
         }
     }
@@ -2583,6 +2621,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         picker.keyEquivalentModifierMask = [.command, .shift, .control]
         viewMenu.addItem(withTitle: "Ad Blocking…",
                          action: #selector(BrowserWindowController.showAdBlockSettings(_:)), keyEquivalent: "")
+        viewMenu.addItem(.separator())
+        let inspector = viewMenu.addItem(
+            withTitle: "Show Web Inspector",
+            action: #selector(BrowserWindowController.toggleWebInspector(_:)), keyEquivalent: "i")
+        inspector.keyEquivalentModifierMask = [.command, .option]
         viewMenu.addItem(.separator())
         let fullScreen = viewMenu.addItem(withTitle: "Enter Full Screen",
                                           action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
