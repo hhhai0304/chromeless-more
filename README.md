@@ -41,6 +41,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘N` | New profile window |
 | `⇧⌘B` | Block ads on this site — off turns the blocker off for that site only |
 | `⌃⇧⌘E` | Pick an element on the page to hide for good |
+| `F12` | Web Inspector (`⌥⌘I` too) |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
 Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.

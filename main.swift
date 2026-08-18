@@ -11,6 +11,7 @@
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //   ⌘T  new tab                  ⌃Tab  next tab
 //   ⇧⌘B  allow ads here          ⌃⇧⌘E  pick an element to hide
+//   F12  web inspector          ⌥⌘I  the same thing
 //   ⌘click  link → background tab   ⇧⌘click  → foreground tab
 //
 // CLI screenshot mode:
@@ -482,6 +483,7 @@ private let startPageTemplate = #"""
     <div class="k"><kbd>&#8679;&#8984; C</kbd></div><div>copy current url</div>
     <div class="k"><kbd>&#8679;&#8984; B</kbd></div><div>ads are blocked everywhere &mdash; this lets them through on one site</div>
     <div class="k"><kbd>&#8963;&#8679;&#8984; E</kbd></div><div>point at anything on the page and hide it for good</div>
+    <div class="k"><kbd>F12</kbd></div>             <div>web inspector &mdash; <kbd>&#8997;&#8984; I</kbd> does it too</div>
   </div>
   <section class="qa" id="qa">
     <button type="button" class="qa-head" id="qa-head" aria-expanded="true">
@@ -834,6 +836,13 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     let conf = WKWebViewConfiguration()
     conf.websiteDataStore = profileStore.websiteDataStore(for: profile)
     conf.preferences.isElementFullscreenEnabled = true
+    // `isInspectable` only unlocks the context menu's Inspect Element. Driving
+    // the inspector from code needs WebKit's developer extras as well — the bit
+    // Safari's Develop menu flips — or `_inspector`'s `show` returns having done
+    // nothing. Guarded, so a rename downgrades to no inspector, not a crash.
+    if conf.preferences.responds(to: NSSelectorFromString("_setDeveloperExtrasEnabled:")) {
+        conf.preferences.setValue(true, forKey: "developerExtrasEnabled")
+    }
     conf.mediaTypesRequiringUserActionForPlayback = []
     conf.allowsAirPlayForMediaPlayback = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
@@ -1468,13 +1477,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
-    // ⌃Tab cannot be a menu key equivalent on macOS, so it is caught here —
-    // and F12 lives here too, so the menu can advertise the Mac-native ⌥⌘I
-    // while the Chrome/Windows reflex still works.
+    // ⌃Tab cannot be a menu key equivalent on macOS, so it is caught here — and
+    // F12 is caught here too, ahead of the menu equivalent that advertises it,
+    // because on keyboards where F12 is wired to volume the key only arrives
+    // fn-modified. ⌥⌘I still works for the Safari reflex, without a second row
+    // in the menu.
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
-            if event.keyCode == 111, !event.modifierFlags.contains(.command) {
+            let mods = event.modifierFlags
+                .intersection(.deviceIndependentFlagsMask)
+                .subtracting([.function, .numericPad, .capsLock])
+            if event.keyCode == 111, mods.isEmpty {
+                self.toggleWebInspector(nil)
+                return nil
+            }
+            if mods == [.command, .option], event.charactersIgnoringModifiers?.lowercased() == "i" {
                 self.toggleWebInspector(nil)
                 return nil
             }
@@ -2684,8 +2702,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         viewMenu.addItem(.separator())
         let inspector = viewMenu.addItem(
             withTitle: "Show Web Inspector",
-            action: #selector(BrowserWindowController.toggleWebInspector(_:)), keyEquivalent: "i")
-        inspector.keyEquivalentModifierMask = [.command, .option]
+            action: #selector(BrowserWindowController.toggleWebInspector(_:)),
+            keyEquivalent: String(UnicodeScalar(UInt32(NSF12FunctionKey))!))
+        inspector.keyEquivalentModifierMask = []
         viewMenu.addItem(.separator())
         let fullScreen = viewMenu.addItem(withTitle: "Enter Full Screen",
                                           action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
