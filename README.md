@@ -165,6 +165,36 @@ the account you are logged into, and no safer.
 Revoking a key at the provider is still the only thing that makes a leaked key
 harmless, and it takes a minute on every provider listed above.
 
+## What a page can reach
+
+A browser runs code written by strangers, so it is worth writing down what that
+code can touch here.
+
+* **The scripts this app injects live in their own content world.** The middle-click
+  handler and the element picker talk to the app over `WKScriptMessageHandler`, and
+  a page cannot see those handlers at all — different content world, different
+  global scope. Before that they sat in the page's world, where any site could post
+  to them: opening tabs unprompted, or writing an element-hiding rule for a domain
+  it does not own.
+* **The start page's bridge is the exception, and carries a nonce.** It has to live
+  in the page world, because the start page is a page. Every message it sends quotes
+  a random value stamped into that document at load time, and the app drops anything
+  that does not match — another site shares the handler but cannot read the document,
+  so it cannot produce the value. Rejected messages are noted on stderr.
+* **An element-hiding rule is always for the page you are looking at.** The domain
+  comes from the loaded URL, never from the message.
+* **Another app's URL scheme needs a click.** `mailto:`, `zoommtg:`, and the rest are
+  handed to macOS when a link or a form asks for it. A page that navigates itself
+  into a scheme gets a confirmation sheet instead, because otherwise any site could
+  launch any registered handler with no gesture at all.
+* **Downloads are quarantined** — WebKit sets `com.apple.quarantine`, so Gatekeeper
+  still gets its say when you open one — land in `~/Downloads`, never overwrite, and
+  cannot escape that folder: the name is reduced to its last path component.
+* **Profiles are separate WebKit data stores**, so cookies, storage, and caches do
+  not cross between them; a private window uses a non-persistent store.
+* **The state files are owner-only** (`0600`): the shortcuts you keep, the sites you
+  allowed ads on, each profile's last page, and the AI keys.
+
 ## Quick access
 
 A small strip of up to ten shortcuts sits under the key list at the bottom of

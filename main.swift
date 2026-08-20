@@ -536,7 +536,12 @@ private let startPageTemplate = #"""
   var dropButton = document.getElementById("drop");
   var editingID = null;
 
+  // Every message carries the nonce this page was built with. A different page
+  // can reach the same handler — they share the page world — but it cannot read
+  // this document, so it cannot produce the nonce, and the app drops it.
+  var NONCE = "__QUICK_ACCESS_NONCE__";
   function post(message) {
+    message.nonce = NONCE;
     try { window.webkit.messageHandlers.chromelessQuickAccess.postMessage(message); } catch (e) {}
   }
 
@@ -682,8 +687,11 @@ private let startPageTemplate = #"""
 </body></html>
 """#
 
-func startPageHTML() -> String {
-    startPageTemplate.replacingOccurrences(of: "__QUICK_ACCESS__", with: quickAccessStore.payloadJSON)
+/// The start page, stamped with the nonce that its bridge has to quote back.
+func startPageHTML(nonce: String) -> String {
+    startPageTemplate
+        .replacingOccurrences(of: "__QUICK_ACCESS__", with: quickAccessStore.payloadJSON)
+        .replacingOccurrences(of: "__QUICK_ACCESS_NONCE__", with: nonce)
 }
 
 // MARK: - Views
@@ -825,6 +833,13 @@ private let auxClickScript = """
 })();
 """
 
+/// Where the scripts this app injects live, and where their message handlers are
+/// registered. A page cannot see `window.webkit.messageHandlers` entries from
+/// another content world, so it cannot post to them — which matters because these
+/// handlers open tabs and write filter rules, and any site could reach them while
+/// they sat in the page's own world.
+let chromelessWorld = WKContentWorld.world(name: "chromeless")
+
 // One shared handler for every web view: it routes by the message's own web
 // view, so it never needs to know which window or profile the page belongs to.
 final class AuxClickRouter: NSObject, WKScriptMessageHandler {
@@ -835,7 +850,10 @@ final class AuxClickRouter: NSObject, WKScriptMessageHandler {
                                didReceive message: WKScriptMessage) {
         guard let webView = message.webView as? BrowserWebView,
               let href = message.body as? String,
-              let url = URL(string: href) else { return }
+              let url = URL(string: href),
+              // Only a web link is a link. `file:` and `data:` reach this far only
+              // if something is wrong, and a tab is not the place to find out.
+              ["http", "https"].contains(url.scheme?.lowercased() ?? "") else { return }
         webView.onOpenLinkInNewTab?(url, true)
     }
 }
@@ -854,11 +872,18 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     conf.mediaTypesRequiringUserActionForPlayback = []
     conf.allowsAirPlayForMediaPlayback = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
-    conf.userContentController.add(AuxClickRouter.shared, name: AuxClickRouter.messageName)
-    conf.userContentController.add(AdBlockPickerRouter.shared, name: AdBlockPickerRouter.messageName)
+    // These two are ours to call and no page's: registered in our own world, they
+    // are invisible to page scripts.
+    conf.userContentController.add(AuxClickRouter.shared, contentWorld: chromelessWorld,
+                                   name: AuxClickRouter.messageName)
+    conf.userContentController.add(AdBlockPickerRouter.shared, contentWorld: chromelessWorld,
+                                   name: AdBlockPickerRouter.messageName)
+    // The start page is a page, so its bridge has to be in the page world. What
+    // keeps another site out is the nonce it carries — see `handleQuickAccess`.
     conf.userContentController.add(QuickAccessRouter.shared, name: QuickAccessRouter.messageName)
     conf.userContentController.addUserScript(WKUserScript(
-        source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false,
+        in: chromelessWorld))
     if !hasPasskeyEntitlement {
         let hideWebAuthn = WKUserScript(
             source: """
@@ -891,6 +916,9 @@ final class Tab {
     // that never opened it and the window is just the page again.
     let aiSession = AIChatSession()
     var aiSidebarOpen = false
+    /// What the start page in this tab must quote back for its bridge to be
+    /// listened to. Nil for a tab showing a website, which is the point.
+    var startPageNonce: String?
 
     init(webView: BrowserWebView) { self.webView = webView }
 
@@ -1278,6 +1306,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     // ⌥ is read when the navigation is still an action, because a response
     // download arrives a round trip later, by which time the key is released.
     private var pendingDownloadWantsPanel = false
+    private var isConfirmingExternalOpen = false
     var profileID: String { profile.id }
     var onClose: (() -> Void)?
 
@@ -2031,7 +2060,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func loadStartPage(in tab: Tab) {
         tab.onStartPage = true
-        tab.webView.loadHTMLString(startPageHTML(), baseURL: nil)
+        // New nonce per load: a stale one from a page that has been navigated away
+        // from is worth nothing.
+        let nonce = UUID().uuidString
+        tab.startPageNonce = nonce
+        tab.webView.loadHTMLString(startPageHTML(nonce: nonce), baseURL: nil)
         tabBar.update(titleAt: tabs.firstIndex { $0 === tab }, to: tab.displayTitle)
     }
 
@@ -2080,7 +2113,19 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             "window.chromelessQuickAccess && window.chromelessQuickAccess.\(call);")
     }
 
+    /// The start page asking for something. Anything else that reaches this — a
+    /// site the user happens to be on, posting to the same handler — cannot know
+    /// the nonce, and is dropped before it can rewrite a shortcut.
     private func handleQuickAccess(_ body: [String: Any], from webView: BrowserWebView) {
+        guard let tab = tab(for: webView), tab.onStartPage,
+              let nonce = tab.startPageNonce,
+              let claimed = body["nonce"] as? String, claimed == nonce else {
+            // Worth a line: this is either a page trying its luck, or a bug in the
+            // start page. Both are things someone would want to see.
+            fputs("chromeless: dropped a quick-access message that did not come "
+                + "from the start page (\(body["action"] as? String ?? "no action"))\n", stderr)
+            return
+        }
         switch body["action"] as? String {
         case "open":
             guard let id = body["id"] as? String,
@@ -2089,7 +2134,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             if body["background"] as? Bool == true {
                 addTab(url: url, activate: body["activate"] as? Bool == true)
             } else {
-                guard let tab = tab(for: webView) else { return }
                 load(url, in: tab)
             }
 
@@ -2125,7 +2169,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         // Sent by the page once its sheet is shut. `refreshQuickAccess` skipped
         // this tab while the sheet was open, so this is the repaint it missed.
         case "ready":
-            guard let tab = tab(for: webView), tab.onStartPage else { return }
             render(into: webView)
 
         default:
@@ -2327,8 +2370,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         // The script's own return value is undefined, which WebKit reports as an
         // error; a trailing literal keeps the completion honest about failures
         // that actually matter.
-        webView.evaluateJavaScript(adBlockPickerScript + "\ntrue;") { [weak self] _, error in
-            guard let error else { return }
+        // Injected into our own content world, the same one its message handler is
+        // registered in: the picker talks to the app, and the page cannot join in.
+        webView.evaluateJavaScript(adBlockPickerScript + "\ntrue;", in: nil,
+                                   in: chromelessWorld) { [weak self] result in
+            guard case .failure(let error) = result else { return }
             self?.showToast("Picker failed — \(error.localizedDescription)")
         }
     }
@@ -2470,10 +2516,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        // Hand non-web schemes (mailto:, facetime:, app links…) to the system.
+        // Hand non-web schemes (mailto:, facetime:, app links…) to the system — but
+        // only when a click asked for it. Script-driven navigation to a scheme is
+        // how a page launches another app behind the user's back, so that one gets
+        // asked about instead.
         if let url = navigationAction.request.url, let scheme = url.scheme?.lowercased(),
            !["http", "https", "file", "about", "data", "blob", "javascript"].contains(scheme) {
-            NSWorkspace.shared.open(url)
+            if navigationAction.navigationType == .linkActivated
+                || navigationAction.navigationType == .formSubmitted {
+                NSWorkspace.shared.open(url)
+            } else {
+                confirmExternalOpen(url)
+            }
             decisionHandler(.cancel)
             return
         }
@@ -2507,6 +2561,25 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
         beginDownload(download, from: webView)
+    }
+
+    /// Asks before letting a page hand a URL to another app. One at a time: a page
+    /// that fires a hundred of these gets one sheet, not a hundred.
+    private func confirmExternalOpen(_ url: URL) {
+        guard let window, !isConfirmingExternalOpen else { return }
+        isConfirmingExternalOpen = true
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Open this in another app?"
+        alert.informativeText = "This page asked macOS to open:\n\n\(url.absoluteString)\n\n"
+            + "Nothing was clicked, so the page asked for this on its own."
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            self?.isConfirmingExternalOpen = false
+            guard response == .alertFirstButtonReturn else { return }
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private func beginDownload(_ download: WKDownload, from webView: WKWebView) {

@@ -153,7 +153,10 @@ final class AdBlockPickerRouter: NSObject, WKScriptMessageHandler {
               let data = body.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String],
               let selector = payload["selector"], !selector.isEmpty,
-              let host = payload["host"],
+              // The rule's domain comes from the page that is loaded, not from the
+              // message: a rule for someone else's site is not the picker's to ask
+              // for, and it is the whole prize if this handler is ever reachable.
+              let host = webView.url?.host ?? payload["host"],
               let domain = registrableDomain(for: host)
         else { return }
         guard FilterCompiler.isSafeSelector(selector) else {
