@@ -577,6 +577,10 @@ final class AdBlockManager {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(settings).write(to: settingsURL, options: .atomic)
+            // The allowlist names sites the user visits often enough to allow ads
+            // on; that is browsing history with extra steps.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: settingsURL.path)
         } catch {
             fputs("chromeless: could not save ad-block settings: \(error.localizedDescription)\n", stderr)
         }

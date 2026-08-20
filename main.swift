@@ -325,6 +325,9 @@ final class ProfileStore {
                 defaultProfileID: defaultProfile.id,
                 profiles: profiles))
             try data.write(to: fileURL, options: .atomic)
+            // Each profile records the last page it was on. Owner-only.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
             fputs("chromeless: could not save profiles: \(error.localizedDescription)\n", stderr)
         }

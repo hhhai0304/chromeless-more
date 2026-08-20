@@ -166,6 +166,10 @@ final class QuickAccessStore {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(QuickAccessArchive(links: links, collapsed: collapsed))
                 .write(to: fileURL, options: .atomic)
+            // The shortcuts someone keeps are a list of the sites they care about,
+            // so no other account on the Mac gets to read them.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
         } catch {
             fputs("chromeless: could not save quick access: \(error.localizedDescription)\n", stderr)
         }
