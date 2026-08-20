@@ -35,6 +35,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
 | `⇧⌘A` | AI sidebar for this tab — ask about the page you are on |
+| `⇧⌘J` | Downloads panel |
 | `⌘T` | New tab |
 | `⌘W` / `⇧⌘W` | Close tab / close the whole window |
 | `⌘1`…`⌘8` `⌘9` | Jump to the nth tab / the last tab |
@@ -45,7 +46,6 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `F12` | Web Inspector (`⌥⌘I` too) |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
-Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
 File uploads use the native open panel: clicking an `<input type="file">` opens it as a sheet, honouring `multiple` and `webkitdirectory`. Dragging files onto the page works too.
 
 ## AI sidebar
@@ -195,6 +195,33 @@ code can touch here.
 * **The state files are owner-only** (`0600`): the shortcuts you keep, the sites you
   allowed ads on, each profile's last page, and the AI keys.
 
+## Downloads
+
+A download starts the moment a page asks for one — or when WebKit cannot display
+what came back — and a panel slides in over the bottom-right corner to show it. The
+panel hides itself again once nothing is running; `⇧⌘J` pins it open, and pins it
+shut. Its header has *Clear* for the finished rows.
+
+Each row is one file: bytes so far against the total, a progress bar, and one button
+that means whatever the row needs.
+
+| Row state | Button | What it does |
+| --- | --- | --- |
+| Running | `⏸` | Pause. WebKit keeps the partial file. |
+| Paused | `▶` | Resume. Without a server validator there is nothing to resume from, and the row says so — it restarts instead of quietly losing progress. |
+| Finished | *Reveal* | Show it in the Finder. Double-click the row to open it; drag the row into any app to copy the file out. |
+| Failed | *Resume* / *Restart* | Whichever the server left possible. |
+
+Files land in `~/Downloads` under the name the server suggested, reduced to its last
+path component and stripped of anything that would let it escape that folder. An
+existing file is never overwritten — `report.pdf` becomes `report-1.pdf`. WebKit
+marks each one with `com.apple.quarantine`, so Gatekeeper still gets its say when you
+open one.
+
+Hold `⌥` while clicking a download link to pick the location yourself in the native
+save panel instead. Downloads run on the window's own profile session, so a file
+behind a login works with whichever account is signed in there.
+
 ## Quick access
 
 A small strip of up to ten shortcuts sits under the key list at the bottom of
@@ -313,7 +340,6 @@ It loads the page, waits for it to settle, writes a Retina PNG, and exits.
 ## Notes
 
 - Cookies, cache, local storage, and login sessions persist per profile on macOS 14+.
-- Downloads use the current window's profile session, so authenticated downloads work with the account logged in there.
 - `--snap` also accepts `--profile`, which is useful for authenticated dashboards.
 
 ## Passkeys

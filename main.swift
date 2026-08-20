@@ -91,6 +91,7 @@ func parseLaunchOptions() -> LaunchOptions {
               --profile <name>  use a specific profile
               --profiles        list profiles and exit
               --adblock-selftest  check the filter converter and exit
+              --adblock-compiletest  convert every installed list and compile it for real
 
             examples:
               chromeless youtube.com
