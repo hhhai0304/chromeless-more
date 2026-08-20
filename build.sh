@@ -19,6 +19,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 \
   -target "$ARCH-apple-macos13.0" \
   main.swift Downloads.swift AdBlock.swift AdBlockFilters.swift AdBlockUI.swift QuickAccess.swift \
+  AI.swift AIUI.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
   -framework Cocoa -framework WebKit
 

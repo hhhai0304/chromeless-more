@@ -11,6 +11,7 @@
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //   ⌘T  new tab                  ⌃Tab  next tab
 //   ⇧⌘B  allow ads here          ⌃⇧⌘E  pick an element to hide
+//   ⇧⌘A  ai sidebar for this tab
 //   F12  web inspector          ⌥⌘I  the same thing
 //   ⌘click  link → background tab   ⇧⌘click  → foreground tab
 //
@@ -481,6 +482,7 @@ private let startPageTemplate = #"""
     <div class="k"><kbd>&#8679;&#8984; H</kbd></div><div>home &mdash; back to this page</div>
     <div class="k"><kbd>&#8984; =</kbd> <kbd>&#8984; &minus;</kbd> <kbd>&#8984; 0</kbd></div><div>zoom</div>
     <div class="k"><kbd>&#8679;&#8984; C</kbd></div><div>copy current url</div>
+    <div class="k"><kbd>&#8679;&#8984; A</kbd></div><div>ai sidebar &mdash; asks about the tab you are on, one chat per tab</div>
     <div class="k"><kbd>&#8679;&#8984; B</kbd></div><div>ads are blocked everywhere &mdash; this lets them through on one site</div>
     <div class="k"><kbd>&#8963;&#8679;&#8984; E</kbd></div><div>point at anything on the page and hide it for good</div>
     <div class="k"><kbd>F12</kbd></div>             <div>web inspector &mdash; <kbd>&#8997;&#8984; I</kbd> does it too</div>
@@ -493,7 +495,10 @@ private let startPageTemplate = #"""
   </section>
   <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
   <br>quick access: click a tile to go, &#8984;-click for a background tab, &#9998; to edit &mdash; icons fetch themselves
-  <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b></footer>
+  <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b>
+  <br>ai sidebar: add a provider &mdash; openrouter, chatgpt, gemini, claude, ollama&hellip; &mdash; and its models in <b>View &rsaquo; AI Settings</b>, then <kbd>&#8679;&#8984;A</kbd> asks about the page you are on
+  <br>the sidebar header switches model per tab, from the ones you added
+  <br><b>View &rsaquo; Show AI Button</b> parks a small &#10022; next to the profile chip for the same thing</footer>
 </main>
 
 <div class="sheet" id="sheet">
@@ -877,6 +882,12 @@ final class Tab {
     var onStartPage = false
     var lastProgress: CGFloat = 0
     var observations: [NSKeyValueObservation] = []
+    // The AI conversation about this tab's page, and whether this tab is showing
+    // the sidebar. Both are per tab on purpose: the sidebar is one view per
+    // window, but it only exists for the tab that asked for it — switch to a tab
+    // that never opened it and the window is just the page again.
+    let aiSession = AIChatSession()
+    var aiSidebarOpen = false
 
     init(webView: BrowserWebView) { self.webView = webView }
 
@@ -889,6 +900,7 @@ final class Tab {
 
     func teardown() {
         observations.removeAll()
+        aiSession.cancel()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
@@ -1251,6 +1263,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var downloadsHide: DispatchWorkItem?
     private var downloadsObservers: [NSObjectProtocol] = []
     private var quickAccessObserver: NSObjectProtocol?
+    private let aiSidebar = AISidebarView()
+    private let aiChip = ProfileChipView()
+    private let aiChipLabel = NSTextField(labelWithString: "✦")
+    private var aiSidebarWidth = AISidebarView.defaultWidth
+    private var aiSettingsObserver: NSObjectProtocol?
+    private var aiButtonObserver: NSObjectProtocol?
+    // Tokens arrive faster than a transcript needs repainting, so renders are
+    // coalesced onto the next tick instead of one per delta.
+    private var aiRenderPending = false
     // ⌥ is read when the navigation is still an action, because a response
     // download arrives a round trip later, by which time the key is released.
     private var pendingDownloadWantsPanel = false
@@ -1264,6 +1285,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     var webView: BrowserWebView { tabs[activeIndex].webView }
     private var tabBarVisible: Bool { tabs.count > 1 }
     private var tabBarHeight: CGFloat { tabBarVisible ? TabBarView.height : 0 }
+    /// The sidebar belongs to the front tab, so this is a question about that tab
+    /// and not about the window.
+    private var aiSidebarShown: Bool { activeTab.aiSidebarOpen }
+    /// How much of the window's width the page keeps once the sidebar has its cut.
+    private var aiSidebarSpan: CGFloat { aiSidebarShown ? aiSidebarWidth : 0 }
+    private var aiChipWidth: CGFloat { AIButtonPreference.isOn ? 32 : 0 }
 
     init(profile: BrowserProfile, url: URL?, size: NSSize?, snap: SnapJob?, isPrimary: Bool) {
         self.profile = profile
@@ -1423,8 +1450,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         // Clearing `isMovable` is the one thing that stops it. `performDrag` is
         // unaffected by the flag, so ⌘-drag and the empty strip still move the
         // window; with a single tab there is no bar and the strip behaves as it
-        // always has.
-        window?.isMovable = !tabBarVisible
+        // always has. The AI sidebar reaches into the same strip, so it needs the
+        // flag cleared for exactly the same reason.
+        window?.isMovable = !(tabBarVisible || aiSidebarShown)
         // Lay out now rather than next frame, so a switch never paints one
         // frame of tabs still sitting at their old positions.
         tabBar.layoutSubtreeIfNeeded()
@@ -1439,6 +1467,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         } else {
             hideHUD()
         }
+        // The sidebar follows the front tab: a tab that never opened it shows no
+        // sidebar at all, and the tab that did keeps its own conversation.
+        syncAISidebar()
     }
 
     private func tab(for webView: WKWebView) -> Tab? {
@@ -1580,8 +1611,186 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
         downloadsPanel.onClose = { [weak self] in self?.hideDownloadsPanel() }
         container.addSubview(downloadsPanel)
+        buildAISidebar(in: container)
         observeDownloads()
         observeQuickAccess()
+    }
+
+    // MARK: AI sidebar
+
+    private func buildAISidebar(in container: NSView) {
+        if let saved = UserDefaults.standard.object(forKey: "ChromelessAISidebarWidth") as? Double,
+           saved >= Double(AISidebarView.minWidth) {
+            aiSidebarWidth = CGFloat(saved)
+        }
+        aiSidebar.isHidden = true
+        aiSidebar.onSend = { [weak self] text in self?.askAI(text) }
+        aiSidebar.onStop = { [weak self] in
+            guard let self else { return }
+            self.activeTab.aiSession.cancel()
+            self.renderAISidebar()
+        }
+        aiSidebar.onClose = { [weak self] in self?.setAISidebar(visible: false) }
+        aiSidebar.onNewChat = { [weak self] in
+            guard let self else { return }
+            self.activeTab.aiSession.reset()
+            self.renderAISidebar()
+            self.aiSidebar.focusComposer()
+        }
+        aiSidebar.onOpenSettings = { AISettingsWindowController.shared.present() }
+        aiSidebar.onToggleContext = { [weak self] on in
+            guard let self else { return }
+            self.activeTab.aiSession.includePage = on
+            if on { self.captureAIPageContext() }
+            self.renderAISidebar()
+        }
+        aiSidebar.onDraftChange = { [weak self] text in self?.activeTab.aiSession.draft = text }
+        aiSidebar.onOpenLink = { [weak self] url in
+            // A link in an answer opens where the reader is looking: a new
+            // background tab, not on top of the page being asked about.
+            self?.addTab(url: url, activate: false)
+        }
+        aiSidebar.onResize = { [weak self] width in self?.resizeAISidebar(to: width) }
+        aiSidebar.onPickModel = { [weak self] ref in
+            guard let self else { return }
+            // The choice belongs to this tab, and becomes what the next new tab
+            // starts on — picking a model twice for the same work is a chore.
+            self.activeTab.aiSession.model = ref
+            aiSettingsStore.update { $0.defaultModel = ref }
+            self.renderAISidebar()
+        }
+        container.addSubview(aiSidebar)
+
+        // The optional round button, parked next to the profile chip. Same view
+        // class as that chip, so hover, blur, and clicks behave identically.
+        aiChip.material = .hudWindow
+        aiChip.blendingMode = .withinWindow
+        aiChip.state = .active
+        aiChip.wantsLayer = true
+        aiChip.layer?.cornerRadius = 12
+        aiChip.layer?.masksToBounds = true
+        aiChip.alphaValue = 0.82
+        aiChip.toolTip = "AI sidebar for this tab (⇧⌘A)"
+        aiChip.isHidden = !AIButtonPreference.isOn
+        aiChip.onClick = { [weak self] in self?.toggleAISidebar(nil) }
+        aiChipLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        aiChipLabel.textColor = .labelColor
+        aiChipLabel.alignment = .center
+        aiChip.addSubview(aiChipLabel)
+        container.addSubview(aiChip)
+
+        aiSettingsObserver = NotificationCenter.default.addObserver(
+            forName: .aiSettingsDidChange, object: nil, queue: .main) { [weak self] _ in
+                guard let self, self.aiSidebarShown else { return }
+                self.renderAISidebar()
+            }
+        aiButtonObserver = NotificationCenter.default.addObserver(
+            forName: .aiButtonPreferenceDidChange, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.aiChip.isHidden = !AIButtonPreference.isOn
+                self.layoutOverlays()
+            }
+    }
+
+    @objc func toggleAISidebar(_ sender: Any?) {
+        setAISidebar(visible: !aiSidebarShown)
+    }
+
+    @objc func showAISettings(_ sender: Any?) {
+        AISettingsWindowController.shared.present()
+    }
+
+    @objc func toggleAIButton(_ sender: Any?) {
+        AIButtonPreference.set(!AIButtonPreference.isOn)
+    }
+
+    private func setAISidebar(visible: Bool) {
+        guard activeTab.aiSidebarOpen != visible else { return }
+        activeTab.aiSidebarOpen = visible
+        syncAISidebar()
+        if visible {
+            aiSidebar.focusComposer()
+        } else {
+            window?.makeFirstResponder(webView)
+        }
+    }
+
+    /// Brings the sidebar in line with the front tab: shown or gone, painted with
+    /// that tab's conversation, and looking at that tab's page.
+    private func syncAISidebar() {
+        aiSidebar.isHidden = !aiSidebarShown
+        // Same reason the tab bar clears it: the sidebar's header sits in the
+        // strip the WindowServer treats as a drag handle.
+        window?.isMovable = !(tabBarVisible || aiSidebarShown)
+        layoutOverlays()
+        guard aiSidebarShown else { return }
+        renderAISidebar()
+        captureAIPageContext()
+    }
+
+    private func resizeAISidebar(to width: CGFloat) {
+        guard let contentWidth = window?.contentView?.bounds.width else { return }
+        let maximum = min(AISidebarView.maxWidth, max(AISidebarView.minWidth, contentWidth - 260))
+        aiSidebarWidth = min(max(width, AISidebarView.minWidth), maximum)
+        UserDefaults.standard.set(Double(aiSidebarWidth), forKey: "ChromelessAISidebarWidth")
+        layoutOverlays()
+    }
+
+    private func renderAISidebar() {
+        guard aiSidebarShown else { return }
+        aiSidebar.render(session: activeTab.aiSession, settings: aiSettingsStore.settings)
+    }
+
+    /// Reads the page so the sidebar can say what it is about to send. The
+    /// capture used for an actual question is taken again at send time.
+    private func captureAIPageContext() {
+        guard aiSidebarShown, activeTab.aiSession.includePage else { return }
+        let tab = activeTab
+        AIPageCapture.capture(from: tab.webView,
+                             limit: aiSettingsStore.settings.maxContextCharacters) { [weak self] page in
+            guard let self, let page else { return }
+            tab.aiSession.pageContext = page
+            guard tab === self.activeTab else { return }
+            self.renderAISidebar()
+        }
+    }
+
+    private func askAI(_ text: String) {
+        let tab = activeTab
+        let session = tab.aiSession
+        guard !session.streaming else { return }
+        guard aiSettingsStore.settings.resolve(session.model) != nil else {
+            AISettingsWindowController.shared.present()
+            return
+        }
+        // The page is read again right before the question goes out, so an answer
+        // is about what is on screen now — not what was there when the sidebar
+        // was opened.
+        guard session.includePage else {
+            startAI(text, in: tab, page: nil)
+            return
+        }
+        AIPageCapture.capture(from: tab.webView,
+                             limit: aiSettingsStore.settings.maxContextCharacters) { [weak self] page in
+            self?.startAI(text, in: tab, page: page)
+        }
+    }
+
+    private func startAI(_ text: String, in tab: Tab, page: AIPageContext?) {
+        tab.aiSession.send(text, page: page) { [weak self, weak tab] in
+            guard let self, let tab, tab === self.activeTab else { return }
+            self.scheduleAIRender()
+        }
+    }
+
+    private func scheduleAIRender() {
+        guard aiSidebarShown, !aiRenderPending else { return }
+        aiRenderPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self else { return }
+            self.aiRenderPending = false
+            self.renderAISidebar()
+        }
     }
 
     // MARK: Downloads panel
@@ -1668,14 +1877,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         guard let contentView = window?.contentView else { return }
         let b = contentView.bounds
 
+        // The sidebar takes its slice off the right edge and everything else —
+        // page, tab bar, HUD, toast, badge, downloads — lays out inside what is
+        // left. A window narrow enough that the sidebar would swallow the page
+        // clamps it back down first.
+        if aiSidebarShown {
+            let maximum = min(AISidebarView.maxWidth, max(AISidebarView.minWidth, b.width - 260))
+            aiSidebarWidth = min(max(aiSidebarWidth, AISidebarView.minWidth), max(maximum, 200))
+        }
+        let sidebar = aiSidebarSpan
+        let pageWidth = max(120, b.width - sidebar)
+        aiSidebar.isHidden = !aiSidebarShown
+        if aiSidebarShown {
+            aiSidebar.frame = NSRect(x: pageWidth, y: 0, width: b.width - pageWidth, height: b.height)
+        }
+
         let barH = tabBarHeight
         tabBar.isHidden = !tabBarVisible
-        tabBar.frame = NSRect(x: 0, y: b.height - barH, width: b.width, height: barH)
-        activeTab.webView.frame = NSRect(x: 0, y: 0, width: b.width, height: b.height - barH)
+        tabBar.frame = NSRect(x: 0, y: b.height - barH, width: pageWidth, height: barH)
+        activeTab.webView.frame = NSRect(x: 0, y: 0, width: pageWidth, height: b.height - barH)
 
-        let hudW = min(620, max(280, b.width - 48))
+        let hudW = min(620, max(280, pageWidth - 48))
         let hudH: CGFloat = 52
-        hud.frame = NSRect(x: (b.width - hudW) / 2, y: b.height - barH - hudH - 84,
+        hud.frame = NSRect(x: (pageWidth - hudW) / 2, y: b.height - barH - hudH - 84,
                            width: hudW, height: hudH)
         hudField.frame = NSRect(x: 20, y: (hudH - 22) / 2, width: hudW - 40, height: 22)
 
@@ -1683,44 +1907,66 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let ts = toastLabel.frame.size
         let tw = ts.width + 32
         let th: CGFloat = 34
-        toastView.frame = NSRect(x: (b.width - tw) / 2, y: 28, width: tw, height: th)
+        toastView.frame = NSRect(x: (pageWidth - tw) / 2, y: 28, width: tw, height: th)
         toastLabel.frame = NSRect(x: 16, y: (th - ts.height) / 2, width: ts.width, height: ts.height)
 
-        // Bottom-right, and never taller than the window leaves room for.
-        let dlW = min(DownloadsPanelView.width, max(240, b.width - 40))
+        // Bottom-right of the page area, and never taller than the window leaves
+        // room for.
+        let dlW = min(DownloadsPanelView.width, max(240, pageWidth - 40))
         let dlH = min(downloadsPanel.preferredHeight, max(120, b.height - barH - 40))
-        downloadsPanel.frame = NSRect(x: b.width - dlW - 20, y: 20, width: dlW, height: dlH)
+        downloadsPanel.frame = NSRect(x: pageWidth - dlW - 20, y: 20, width: dlW, height: dlH)
 
-        let profileMaxW = min(180, max(90, b.width * 0.34))
+        let profileMaxW = min(180, max(90, pageWidth * 0.34))
         let profileTextW = min(profileMaxW - 22, profileLabel.intrinsicContentSize.width)
         let profileW = max(72, profileTextW + 22)
         let profileH: CGFloat = 24
 
         // One chip, two homes: docked in the tab bar when it is up, floating in
-        // the corner when it is not.
+        // the corner when it is not. The AI button, when it is on, rides along
+        // just to its left and moves house with it.
+        let aiSide: CGFloat = 24
         if tabBarVisible {
             if profileBadge.superview !== tabBar {
                 profileBadge.removeFromSuperview()
                 tabBar.addSubview(profileBadge)
             }
-            tabBar.setChipWidth(profileW)
+            if aiChip.superview !== tabBar {
+                aiChip.removeFromSuperview()
+                tabBar.addSubview(aiChip)
+            }
+            tabBar.setChipWidth(profileW + aiChipWidth)
             profileBadge.frame = NSRect(
-                x: b.width - profileW - 12,
+                x: pageWidth - profileW - 12,
                 y: (barH - profileH) / 2,
                 width: profileW,
                 height: profileH)
+            aiChip.frame = NSRect(
+                x: profileBadge.frame.minX - aiSide - 8,
+                y: (barH - aiSide) / 2,
+                width: aiSide,
+                height: aiSide)
         } else {
             if profileBadge.superview !== contentView {
                 profileBadge.removeFromSuperview()
                 contentView.addSubview(profileBadge)
             }
+            if aiChip.superview !== contentView {
+                aiChip.removeFromSuperview()
+                contentView.addSubview(aiChip)
+            }
             let topInset: CGFloat = isFullScreen ? 18 : 12
             profileBadge.frame = NSRect(
-                x: b.width - profileW - 14,
+                x: pageWidth - profileW - 14,
                 y: b.height - profileH - topInset,
                 width: profileW,
                 height: profileH)
+            aiChip.frame = NSRect(
+                x: profileBadge.frame.minX - aiSide - 8,
+                y: b.height - aiSide - topInset,
+                width: aiSide,
+                height: aiSide)
         }
+        aiChipLabel.frame = NSRect(x: 0, y: (aiSide - 15) / 2, width: aiSide, height: 15)
         profileLabel.frame = NSRect(
             x: 11,
             y: (profileH - 14) / 2,
@@ -1728,7 +1974,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             height: 14)
 
         progressBar.frame = NSRect(x: 0, y: b.height - barH - 2,
-                                   width: b.width * activeTab.lastProgress, height: 2)
+                                   width: pageWidth * activeTab.lastProgress, height: 2)
     }
 
     private func observe(_ tab: Tab) {
@@ -1754,7 +2000,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private func progressChanged(_ progress: Double) {
         activeTab.lastProgress = CGFloat(progress)
         if let width = window?.contentView?.bounds.width {
-            progressBar.frame.size.width = width * activeTab.lastProgress
+            progressBar.frame.size.width = (width - aiSidebarSpan) * activeTab.lastProgress
         }
         if progress >= 1.0 {
             NSAnimationContext.runAnimationGroup({ ctx in
@@ -2131,6 +2377,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(toggleWebInspector(_:)):
             menuItem.title = isWebInspectorVisible ? "Hide Web Inspector" : "Show Web Inspector"
             return webInspector != nil
+        case #selector(toggleAISidebar(_:)):
+            menuItem.state = aiSidebarShown ? .on : .off
+            return true
+        case #selector(toggleAIButton(_:)):
+            menuItem.state = AIButtonPreference.isOn ? .on : .off
+            return true
         default: return true
         }
     }
@@ -2151,6 +2403,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         downloadsObservers.removeAll()
         if let observer = quickAccessObserver { NotificationCenter.default.removeObserver(observer) }
         quickAccessObserver = nil
+        if let observer = aiSettingsObserver { NotificationCenter.default.removeObserver(observer) }
+        aiSettingsObserver = nil
+        if let observer = aiButtonObserver { NotificationCenter.default.removeObserver(observer) }
+        aiButtonObserver = nil
         // Downloads outlive their window on purpose: the manager holds the
         // delegate, so tearing down these tabs does not stop a transfer.
         for tab in tabs { tab.teardown() }
@@ -2168,6 +2424,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         guard let finished = tab(for: webView) else { return }
         tabBar.update(titleAt: tabs.firstIndex { $0 === finished }, to: finished.displayTitle)
         guard finished === activeTab else { return }
+        // A new page means new context for the question being typed about it.
+        if aiSidebarShown { captureAIPageContext() }
         if let job = snapJob {
             snapJob = nil
             runSnapJob(job)
@@ -2688,6 +2946,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             withTitle: "Show Downloads",
             action: #selector(BrowserWindowController.toggleDownloadsPanel(_:)), keyEquivalent: "j")
         downloads.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(.separator())
+        let aiSidebar = viewMenu.addItem(
+            withTitle: "AI Sidebar",
+            action: #selector(BrowserWindowController.toggleAISidebar(_:)), keyEquivalent: "a")
+        aiSidebar.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(withTitle: "Show AI Button",
+                         action: #selector(BrowserWindowController.toggleAIButton(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "AI Settings…",
+                         action: #selector(BrowserWindowController.showAISettings(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let siteBlocking = viewMenu.addItem(
             withTitle: "Block Ads on This Site",

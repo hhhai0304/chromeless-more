@@ -34,6 +34,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) |
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
+| `⇧⌘A` | AI sidebar for this tab — ask about the page you are on |
 | `⌘T` | New tab |
 | `⌘W` / `⇧⌘W` | Close tab / close the whole window |
 | `⌘1`…`⌘8` `⌘9` | Jump to the nth tab / the last tab |
@@ -46,6 +47,123 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
 Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
 File uploads use the native open panel: clicking an `<input type="file">` opens it as a sheet, honouring `multiple` and `webkitdirectory`. Dragging files onto the page works too.
+
+## AI sidebar
+
+`⇧⌘A` slides a chat panel in from the right edge. The page does not move under it —
+the window is split, so the page keeps its own width and nothing overlaps. Drag the
+panel's left edge to resize it; the width is remembered.
+
+**One conversation per tab.** The chat belongs to the tab, not the window: switch
+tabs and the transcript switches with it, half-typed question included. Close the
+tab and it is gone. Two tabs on the same site are two separate threads. Snapshots
+(`⇧⌘S`) still capture the page only, so the sidebar never lands in a screenshot.
+
+**The page goes with the question.** With *Use page* on, the tab's text is read
+fresh on every question — `innerText`, so scripts, styles, and hidden elements are
+already gone — along with the URL, the title, and whatever you have selected. The
+line under the composer says where the context came from and how big it is. Long
+pages are trimmed head-and-tail to the character budget in the settings (24k by
+default, roughly 6k tokens). Only the main frame is readable; cross-origin iframes
+are not.
+
+**A model per tab.** The header names the model this tab is talking to, and it is a
+picker: every model you have added is in it, grouped by provider. Switching there
+switches this tab only — one tab can sit on a big model for a dense page while the
+next stays on a cheap one — and the last pick becomes what new tabs start on. To put
+something new in that list, go to the settings; the sidebar never asks for a URL or
+a key.
+
+### Setting up providers and models
+
+**View ▸ AI Settings…** keeps a list of endpoints and, under each one, the models you
+added. *Add Provider* fills in a base URL from a template; the key is the only thing
+you have to paste:
+
+| Template | Base URL |
+| --- | --- |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| OpenAI (ChatGPT) | `https://api.openai.com/v1` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| Anthropic (Claude) | `https://api.anthropic.com/v1` |
+| Groq · DeepSeek · xAI · Mistral | their own `/v1` endpoints |
+| Ollama · LM Studio | `http://localhost:11434/v1` · `http://localhost:1234/v1` — no key needed |
+| Custom | whatever serves `POST {base}/chat/completions` |
+
+*Add Models…* asks the endpoint for its catalogue (`GET {base}/models`) and shows it
+as a ticklist with a search box — OpenRouter's few hundred ids are only usable that
+way. Models already added come back ticked and marked *added*, so the list says what
+is there rather than offering it twice. Providers that cannot list — Anthropic — show
+the ids that are known instead, and there is a field for typing one either way. The
+same provider can be added twice under two names if you want two keys against it.
+
+**Models stay out of the sidebar until their provider passes *Check Connection*.**
+The check is a real completion — capped at sixteen tokens, and sent again without the
+cap for the reasoning models that reject it — because a live round trip is the only
+thing that proves the URL, the key, and the credit actually work. It asks with the
+first model added, since the point is the endpoint and not the id; a wrong id fails
+on the first question instead, in the endpoint's own words. On OpenRouter the check
+also reports the key's label and the credit left. Edit the URL or the key afterwards
+and that provider's models drop out of the picker until it is checked again, so a
+typo shows up once instead of on every question.
+
+Everything else in the window — the page-context budget, the default for *Use page*,
+and the system prompt — applies to every provider.
+
+**A busy provider is not a broken one.** Gemini answers `503 UNAVAILABLE` whenever
+the model is loaded, and every one of these endpoints rate-limits. Those replies are
+retried with backoff before anything is said about them, and a question that dies
+that way before its first token arrives is sent once more on its own. Only after
+that does the sidebar show the failure — with the note that the retries are already
+spent, so waiting or picking another model is what is left.
+
+Answers stream in as they are generated; *Stop* keeps what has arrived so far. The
+`＋` button starts a fresh chat in that tab, `⚙` opens these settings, and a link in
+an answer — a markdown link, a bare URL, or an `<autolink>` — opens in a background
+tab.
+
+**View ▸ Show AI Button** parks a small `✦` next to the profile chip for opening the
+sidebar by mouse. It is off by default, because the window is supposed to be the
+page.
+
+Settings live at:
+
+```text
+~/Library/Application Support/Chromeless/ai.json
+```
+
+An `ai.json` from before this list existed — one base URL, one key, one model id — is
+read as a single provider with that model already added, and its passing check is
+kept if it named that exact URL and key. Nothing has to be set up twice.
+
+### What that means for the keys
+
+The keys are in that file in plaintext, and the honest summary is: it is as safe as
+the account you are logged into, and no safer.
+
+* The file is `0600`, owner-only. The mode is set on an empty temporary file before
+  a key is written into it, and that file is then moved into place — writing first
+  and fixing the mode afterwards leaves a world-readable file in between.
+* What records a passing check is a SHA-256 digest of the URL and key, not the key,
+  so the file holds each key exactly once. A stamp written by an older build in the
+  clear is upgraded the first time anything is saved.
+* Nothing logs a key, `--snap` cannot photograph the settings window, and the field
+  shows dots.
+* A key is sent as a `Bearer` header to the base URL of its own provider and nowhere
+  else. If that URL is plain `http://` to another machine, it crosses the network in
+  the clear and the settings window says so — `http://localhost`, which is how Ollama
+  and LM Studio work, does not leave the machine and is not flagged.
+* **It is not encrypted at rest.** Any process running as you can read it, exactly
+  like `~/.ssh/id_rsa` or a `.env`. Full-disk encryption (FileVault) is what protects
+  it when the Mac is off.
+* The Keychain would add a consent prompt for other apps, and was skipped for a
+  concrete reason: a Keychain ACL is tied to the signing identity, and an ad-hoc
+  signature changes with every rebuild, so it would ask for the login password each
+  time the app is rebuilt. A signed, notarised build could keep the keys there — for
+  a browser you rebuild yourself, `0600` is the better trade.
+
+Revoking a key at the provider is still the only thing that makes a leaked key
+harmless, and it takes a minute on every provider listed above.
 
 ## Quick access
 
