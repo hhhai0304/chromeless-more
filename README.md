@@ -280,7 +280,7 @@ Chromeless ships a small built-in list and subscribes to **EasyList**,
 **EasyPrivacy**, and **ABPVN** on first launch, refreshing them weekly. Together
 they compile to about 114,000 rules. **View → Ad Blocking…** manages
 subscriptions, adds your own list URLs, edits your own filter rules, and lists
-the sites you turned blocking off for.
+the sites blocking is off for — added there by domain or toggled with ⇧⌘B.
 
 - `⇧⌘B` toggles blocking for the site you are on. Some sites do break without
   their ad frames; this is the escape hatch.

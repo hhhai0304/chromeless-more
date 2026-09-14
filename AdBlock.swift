@@ -160,6 +160,30 @@ final class AdBlockManager {
         return true
     }
 
+    // Sites can also be typed straight into the settings window, where no loaded
+    // page supplies the domain. A full URL works — only its registrable domain
+    // is stored, which is exactly what ⇧⌘B puts here. Returns the stored domain,
+    // or nil when the input cannot name a site at all.
+    @discardableResult
+    func addToAllowlist(_ input: String) -> String? {
+        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A little filter-syntax tolerance: "||example.com^" means the domain.
+        if text.hasPrefix("||") { text.removeFirst(2) }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "^"))
+        let candidate = text.contains("://") ? text : "https://\(text)"
+        let host = URL(string: candidate)?.host ?? text
+        guard let domain = registrableDomain(for: host), !domain.isEmpty,
+              domain.rangeOfCharacter(
+                  from: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789.-").inverted
+              ) == nil else { return nil }
+        if !settings.allowlist.contains(domain) {
+            settings.allowlist.append(domain)
+            saveSettings()
+            rebuild()
+        }
+        return domain
+    }
+
     func removeFromAllowlist(_ domain: String) {
         settings.allowlist.removeAll { $0 == domain }
         saveSettings()

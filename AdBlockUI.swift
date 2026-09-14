@@ -299,12 +299,15 @@ final class AdBlockSettingsWindowController: NSWindowController, NSWindowDelegat
         content.addSubview(allowScroll)
 
         y -= 32
+        let addSite = button("Add Site…", #selector(addSite))
+        addSite.frame = NSRect(x: margin, y: y, width: 100, height: 24)
+        content.addSubview(addSite)
         removeSiteButton.title = "Block Ads Here Again"
         removeSiteButton.bezelStyle = .rounded
         removeSiteButton.font = .systemFont(ofSize: 12)
         removeSiteButton.target = self
         removeSiteButton.action = #selector(removeSite)
-        removeSiteButton.frame = NSRect(x: margin, y: y, width: 180, height: 24)
+        removeSiteButton.frame = NSRect(x: margin + 108, y: y, width: 180, height: 24)
         content.addSubview(removeSiteButton)
 
         y -= 30
@@ -406,6 +409,37 @@ final class AdBlockSettingsWindowController: NSWindowController, NSWindowDelegat
         let row = allowTable.selectedRow
         guard allowlist.indices.contains(row) else { return }
         adBlockManager.removeFromAllowlist(allowlist[row])
+    }
+
+    @objc private func addSite() {
+        let alert = NSAlert()
+        alert.messageText = "Turn Blocking Off for a Site"
+        alert.informativeText = "Type a domain or paste a page URL."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 22))
+        field.placeholderString = "example.com"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let domain = adBlockManager.addToAllowlist(field.stringValue) else {
+            let failure = NSAlert()
+            failure.messageText = "That Doesn’t Look Like a Site"
+            failure.informativeText = "Type a domain like “example.com”, or paste a full URL."
+            failure.addButton(withTitle: "OK")
+            failure.runModal()
+            return
+        }
+        if let row = allowlist.firstIndex(of: domain) {
+            // The change notification reloads the table on the next pass through
+            // the run loop, so the selection has to wait for it.
+            DispatchQueue.main.async { [weak self] in
+                self?.allowTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                self?.allowTable.scrollRowToVisible(row)
+            }
+        }
     }
 
     @objc private func toggleList(_ sender: NSButton) {
