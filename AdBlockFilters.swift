@@ -62,7 +62,7 @@ struct CompiledRuleSet {
 struct FilterCompiler {
     // Bumped whenever conversion changes, so a cached compiled list built by an
     // older converter is not reused after an update.
-    static let version = 1
+    static let version = 2
     // WebKit's own ceiling. EasyList, EasyPrivacy and ABPVN together convert to
     // about 114k rules, so in practice nothing is dropped; the cap exists so a
     // pathological subscription cannot take the compile down. Exceptions and the
@@ -211,6 +211,21 @@ struct FilterCompiler {
         }
 
         guard let filter = Self.urlFilter(from: pattern) else { skippedCount += 1; return }
+
+        // A pattern that matches every URL is only as narrow as what is left to
+        // narrow it. `$ping,third-party` — every cross-origin ping on the web —
+        // is a rule a blocker is meant to carry; the same shape aimed at a type
+        // pages are built out of is not something any subscription means, and it
+        // takes sign-ins, APIs and whole sites down without a trace. Subscription
+        // lists update on their own, so this is checked on the way in rather
+        // than trusted to stay correct.
+        if !isException && filter == ".*" && options.ifDomains.isEmpty {
+            let types = Set(options.resourceTypes ?? [])
+            if types.isEmpty || !types.isDisjoint(with: FilterOptions.loadBearingTypes) {
+                skippedCount += 1
+                return
+            }
+        }
 
         let trigger = WebKitTrigger(
             urlFilter: filter,
@@ -437,6 +452,11 @@ struct FilterOptions {
     // navigations would take whole pages down.
     static let complementTypes = ["image", "style-sheet", "script", "font", "raw", "svg-document", "media"]
 
+    // Types a page is built out of, as opposed to types it merely leaks through.
+    // Blocking every third-party `ping` on the web is what a blocker is for;
+    // blocking every third-party `raw` breaks every sign-in flow there is.
+    static let loadBearingTypes: Set<String> = ["document", "raw", "script", "style-sheet"]
+
     static let typeMap: [String: String] = [
         "script": "script",
         "image": "image",
@@ -452,12 +472,17 @@ struct FilterOptions {
         "doc": "document",
         "xmlhttprequest": "raw",
         "xhr": "raw",
-        "websocket": "raw",
-        "ping": "raw",
-        "beacon": "raw",
-        "other": "raw",
-        "object": "raw",
-        "object-subrequest": "raw",
+        // WebKit has had a type of its own for each of these since Safari 15;
+        // folding them into `raw` made every one of them a rule about XHR and
+        // fetch instead. `$beacon` is ABP's alias for `$ping`. Plugin content
+        // has no WebKit type left, so `$object` lands in the catch-all rather
+        // than on the requests a page is actually assembled from.
+        "websocket": "websocket",
+        "ping": "ping",
+        "beacon": "ping",
+        "other": "other",
+        "object": "other",
+        "object-subrequest": "other",
     ]
 
     // Modifiers that rewrite, inject, or otherwise do something WebKit's engine
@@ -800,6 +825,17 @@ func runAdBlockSelfTest() -> Never {
         $0.ifDomains == ["*a.com"] && $0.unlessDomains == ["*b.com"]
     }
     expectOptions("redirect=noop.js", "rewriting options are refused") { $0.unsupported }
+    // `$ping` is hyperlink auditing, not XHR. Folding it into `raw` turned
+    // EasyPrivacy's `$ping,third-party` into "block every cross-origin fetch on
+    // the web", which is what broke signing in to Outlook.
+    expectOptions("ping,third-party", "ping keeps its own resource type") {
+        $0.resourceTypes == ["ping"] && $0.loadType == ["third-party"]
+    }
+    expectOptions("beacon", "beacon is an alias for ping") { $0.resourceTypes == ["ping"] }
+    expectOptions("websocket", "websocket keeps its own resource type") {
+        $0.resourceTypes == ["websocket"]
+    }
+    expectOptions("other", "other keeps its own resource type") { $0.resourceTypes == ["other"] }
     expectOptions("document", "document scopes an exception") { $0.documentScoped }
     expectOptions("important", "priority modifiers keep the rule") {
         !$0.unsupported && $0.resourceTypes == nil
@@ -816,6 +852,35 @@ func runAdBlockSelfTest() -> Never {
             print("✗ registrable domain \(host): expected \(expected), got \(actual ?? "nil")")
         }
     }
+
+    // A rule that matches every URL is only ever as narrow as its resource type
+    // and page scope. One that blocks a load-bearing type everywhere takes the
+    // whole web down, so the converter has to refuse it however it arrived.
+    func expectNoCatchAll(_ line: String, _ label: String) {
+        var probe = FilterCompiler()
+        probe.ingest(line)
+        let json = probe.finish(allowlist: []).json
+        let rules = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [[String: Any]] ?? []
+        let offenders = rules.filter { rule in
+            let trigger = rule["trigger"] as? [String: Any] ?? [:]
+            guard (rule["action"] as? [String: Any])?["type"] as? String == "block",
+                  trigger["url-filter"] as? String == ".*",
+                  trigger["if-domain"] == nil else { return false }
+            let types = Set(trigger["resource-type"] as? [String] ?? [])
+            return types.isEmpty || !types.isDisjoint(with: FilterOptions.loadBearingTypes)
+        }
+        if offenders.isEmpty {
+            print("✓ \(label)")
+        } else {
+            failures += 1
+            print("✗ \(label)\n    input:  \(line)\n    became: \(offenders)")
+        }
+    }
+
+    expectNoCatchAll("$ping,third-party", "EasyPrivacy's bare $ping,third-party blocks nothing wholesale")
+    expectNoCatchAll("$third-party", "an option-only third-party rule is refused")
+    expectNoCatchAll("*$xmlhttprequest", "a bare wildcard XHR rule is refused")
+    expectNoCatchAll("$script,third-party", "an unscoped third-party script rule is refused")
 
     var compiler = FilterCompiler()
     compiler.ingest(builtInFilterList)
