@@ -802,6 +802,25 @@ final class ProfileChipView: NSVisualEffectView {
     override func mouseDown(with event: NSEvent) { onClick?() }
 }
 
+extension Notification.Name {
+    static let profileChipPreferenceDidChange = Notification.Name("chromeless.profileChipDidChange")
+}
+
+/// Whether the profile chip shows — docked in the tab bar or floating in the
+/// corner. On by default, since it is the main way into the profile picker,
+/// and shared by every window, which is why it lives in defaults rather than
+/// on a controller. Profiles stay reachable through ⌘N either way.
+enum ProfileChipPreference {
+    private static let key = "ChromelessShowProfileChip"
+
+    static var isOn: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+
+    static func set(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: key)
+        NotificationCenter.default.post(name: .profileChipPreferenceDidChange, object: nil)
+    }
+}
+
 // MARK: - Tabs
 
 // WebKit does not treat a middle-click on a link as a request for a new window
@@ -1301,6 +1320,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var aiSidebarWidth = AISidebarView.defaultWidth
     private var aiSettingsObserver: NSObjectProtocol?
     private var aiButtonObserver: NSObjectProtocol?
+    private var profileChipObserver: NSObjectProtocol?
     // Tokens arrive faster than a transcript needs repainting, so renders are
     // coalesced onto the next tick instead of one per delta.
     private var aiRenderPending = false
@@ -1642,6 +1662,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         profileBadge.addSubview(profileLabel)
         container.addSubview(profileBadge)
 
+        profileChipObserver = NotificationCenter.default.addObserver(
+            forName: .profileChipPreferenceDidChange, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.layoutOverlays()
+            }
+
         downloadsPanel.onClose = { [weak self] in self?.hideDownloadsPanel() }
         container.addSubview(downloadsPanel)
         buildAISidebar(in: container)
@@ -1735,6 +1761,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func toggleAIButton(_ sender: Any?) {
         AIButtonPreference.set(!AIButtonPreference.isOn)
+    }
+
+    @objc func toggleProfileChip(_ sender: Any?) {
+        ProfileChipPreference.set(!ProfileChipPreference.isOn)
     }
 
     private func setAISidebar(visible: Bool) {
@@ -1949,14 +1979,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let dlH = min(downloadsPanel.preferredHeight, max(120, b.height - barH - 40))
         downloadsPanel.frame = NSRect(x: pageWidth - dlW - 20, y: 20, width: dlW, height: dlH)
 
+        let profileShown = ProfileChipPreference.isOn
         let profileMaxW = min(180, max(90, pageWidth * 0.34))
         let profileTextW = min(profileMaxW - 22, profileLabel.intrinsicContentSize.width)
-        let profileW = max(72, profileTextW + 22)
+        let profileW: CGFloat = profileShown ? max(72, profileTextW + 22) : 0
         let profileH: CGFloat = 24
+        profileBadge.isHidden = !profileShown
 
         // One chip, two homes: docked in the tab bar when it is up, floating in
         // the corner when it is not. The AI button, when it is on, rides along
-        // just to its left and moves house with it.
+        // just to its left and moves house with it — and takes over the corner
+        // spot entirely when the profile chip is off.
         let aiSide: CGFloat = 24
         if tabBarVisible {
             if profileBadge.superview !== tabBar {
@@ -1974,7 +2007,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 width: profileW,
                 height: profileH)
             aiChip.frame = NSRect(
-                x: profileBadge.frame.minX - aiSide - 8,
+                x: profileBadge.frame.minX - aiSide - (profileShown ? 8 : 0),
                 y: (barH - aiSide) / 2,
                 width: aiSide,
                 height: aiSide)
@@ -1994,7 +2027,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 width: profileW,
                 height: profileH)
             aiChip.frame = NSRect(
-                x: profileBadge.frame.minX - aiSide - 8,
+                x: profileBadge.frame.minX - aiSide - (profileShown ? 8 : 0),
                 y: b.height - aiSide - topInset,
                 width: aiSide,
                 height: aiSide)
@@ -2003,7 +2036,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         profileLabel.frame = NSRect(
             x: 11,
             y: (profileH - 14) / 2,
-            width: profileW - 22,
+            width: max(0, profileW - 22),
             height: 14)
 
         progressBar.frame = NSRect(x: 0, y: b.height - barH - 2,
@@ -2433,6 +2466,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(toggleAIButton(_:)):
             menuItem.state = AIButtonPreference.isOn ? .on : .off
             return true
+        case #selector(toggleProfileChip(_:)):
+            menuItem.state = ProfileChipPreference.isOn ? .on : .off
+            return true
         default: return true
         }
     }
@@ -2457,6 +2493,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         aiSettingsObserver = nil
         if let observer = aiButtonObserver { NotificationCenter.default.removeObserver(observer) }
         aiButtonObserver = nil
+        if let observer = profileChipObserver { NotificationCenter.default.removeObserver(observer) }
+        profileChipObserver = nil
         // Downloads outlive their window on purpose: the manager holds the
         // delegate, so tearing down these tabs does not stop a transfer.
         for tab in tabs { tab.teardown() }
@@ -3023,6 +3061,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             withTitle: "Show Downloads",
             action: #selector(BrowserWindowController.toggleDownloadsPanel(_:)), keyEquivalent: "j")
         downloads.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(withTitle: "Show Profile Button",
+                         action: #selector(BrowserWindowController.toggleProfileChip(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let aiSidebar = viewMenu.addItem(
             withTitle: "AI Sidebar",
