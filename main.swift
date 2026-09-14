@@ -892,6 +892,11 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
     conf.mediaTypesRequiringUserActionForPlayback = []
     conf.allowsAirPlayForMediaPlayback = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
+    // SSO sign-ins often reach window.open only after an async hop — fetch the
+    // IdP URL, then open it — by which point WebKit no longer counts the click
+    // as a gesture and silently drops the popup: createWebViewWith is never
+    // called, window.open returns null, and the Sign in button looks dead.
+    conf.preferences.javaScriptCanOpenWindowsAutomatically = true
     // These two are ours to call and no page's: registered in our own world, they
     // are invisible to page scripts.
     conf.userContentController.add(AuxClickRouter.shared, contentWorld: chromelessWorld,
@@ -2548,6 +2553,76 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         showToast("Couldn’t load — \(e.localizedDescription)")
     }
 
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        // A crashed content process leaves a dead white tab; reload brings it back.
+        webView.reload()
+    }
+
+    // Password-style challenges — Basic, Digest, and NTLM, the last being what
+    // "Windows login" on intranet sites and on-prem Exchange/ADFS actually is —
+    // need credentials only the user can supply; WebKit's default handling just
+    // answers with a 401. Negotiate, client certificates, and server trust stay
+    // with the system.
+    func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
+                 completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        switch challenge.protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodHTTPBasic,
+             NSURLAuthenticationMethodHTTPDigest,
+             NSURLAuthenticationMethodNTLM where launchOptions.snap == nil:
+            promptForCredentials(webView: webView, challenge: challenge,
+                                 completionHandler: completionHandler)
+        default:
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+
+    private func promptForCredentials(webView: WKWebView, challenge: URLAuthenticationChallenge,
+                                      completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        // A rejected password re-arms the same challenge; after a few refusals
+        // let the server render its own 401 page rather than loop the sheet.
+        guard challenge.previousFailureCount < 3 else {
+            completionHandler(.rejectProtectionSpace, nil)
+            return
+        }
+        let space = challenge.protectionSpace
+        let alert = NSAlert()
+        alert.messageText = "Sign in to \(space.host)"
+        alert.informativeText = space.realm.map { "Realm: \($0)" }
+            ?? "This site requires a username and password."
+        let userField = NSTextField(frame: NSRect(x: 0, y: 30, width: 240, height: 22))
+        let passField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        userField.placeholderString = "Username"
+        passField.placeholderString = "Password"
+        if let proposed = challenge.proposedCredential, let name = proposed.user {
+            userField.stringValue = name
+        }
+        let fields = NSView(frame: NSRect(x: 0, y: 0, width: 240, height: 52))
+        fields.addSubview(userField)
+        fields.addSubview(passField)
+        alert.accessoryView = fields
+        alert.addButton(withTitle: "Sign In")
+        alert.addButton(withTitle: "Cancel")
+        // The floating HUD would sit under the sheet.
+        hideHUD()
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn, !userField.stringValue.isEmpty else {
+                // Rejecting the space stops WebKit from re-asking and lets the
+                // server's 401 page through.
+                completionHandler(.rejectProtectionSpace, nil)
+                return
+            }
+            let credential = URLCredential(user: userField.stringValue,
+                                           password: passField.stringValue,
+                                           persistence: .forSession)
+            completionHandler(.useCredential, credential)
+        }
+        if let window = webView.window ?? self.window {
+            alert.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            finish(alert.runModal())
+        }
+    }
+
     private func exitForSnapDownload() -> Never {
         fputs("chromeless: page attempted to download a file during --snap\n", stderr)
         exit(1)
@@ -2642,9 +2717,23 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         // this method — the page script cancels it and reports the href instead
         // — and ⌘-click never reaches the page at all, because `BrowserWebView`
         // claims ⌘ for dragging the window.
+        // The configuration WebKit hands over shares the opener's session and
+        // process but not this preference — reset it or a sign-in popup could
+        // not chain a second popup (an MFA prompt, an account picker) of its own.
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         // Handing back a live web view lets WebKit drive the load itself, so
         // window.open + document.write popups work, not just plain links.
         return addTab(url: nil, configuration: configuration).webView
+    }
+
+    func webViewDidClose(_ webView: WKWebView) {
+        // WebKit forwards window.close() only for pages a script itself opened —
+        // which is to say, sign-in popups finishing their handshake. Close the
+        // tab and hand the window back to the opener, which by now is usually
+        // already signed in. When the popup outlived its opener and is the last
+        // tab, closeTab performs the window close itself.
+        guard let index = tabs.firstIndex(where: { $0.webView === webView }) else { return }
+        closeTab(at: index)
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
