@@ -42,6 +42,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSCameraUsageDescription</key><string>Chromeless asks for the camera only when a site you open requests it.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Chromeless asks for the microphone only when a site you open requests it.</string>
+  <key>NSLocationWhenInUseUsageDescription</key><string>Chromeless asks for your location only when a site you open requests it.</string>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
   <key>NSHumanReadableCopyright</key><string>chromeless — the browser that isn’t there</string>

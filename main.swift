@@ -10,6 +10,8 @@
 //   ⌘[ ⌘]  back / forward        ⌃⌘F  fullscreen
 //   ⌘= ⌘- ⌘0  zoom               ⌘drag  move the window
 //   ⌘T  new tab                  ⌃Tab  next tab
+//   ⇧⌘T  reopen a closed tab     ⇧⌘N   private window
+//   ⌘F  find in page             ⌘G ⇧⌘G  next / previous match
 //   ⇧⌘B  allow ads here          ⌃⇧⌘E  pick an element to hide
 //   ⇧⌘A  ai sidebar for this tab
 //   F12  web inspector          ⌥⌘I  the same thing
@@ -68,6 +70,7 @@ struct LaunchOptions {
     var restoreLastPage = false
     var profile: String? = nil
     var listProfiles = false
+    var privateWindow = false
 }
 
 func parseLaunchOptions() -> LaunchOptions {
@@ -90,6 +93,7 @@ func parseLaunchOptions() -> LaunchOptions {
               --restore         reopen the last saved page instead of the start page
               --profile <name>  use a specific profile
               --profiles        list profiles and exit
+              --private         open a private window (nothing is saved)
               --adblock-selftest  check the filter converter and exit
               --adblock-compiletest  convert every installed list and compile it for real
 
@@ -118,6 +122,8 @@ func parseLaunchOptions() -> LaunchOptions {
             if i < args.count { opts.profile = args[i] }
         case "--profiles":
             opts.listProfiles = true
+        case "--private":
+            opts.privateWindow = true
         case "--adblock-selftest":
             runAdBlockSelfTest()
         case "--adblock-compiletest":
@@ -474,9 +480,12 @@ private let startPageTemplate = #"""
   <h1>chromeless</h1>
   <p class="tag">the browser that isn&rsquo;t there</p>
   <div class="keys">
-    <div class="k"><kbd>&#8984; L</kbd></div>       <div>search or enter a url</div>
+    <div class="k"><kbd>&#8984; L</kbd></div>       <div>search or enter a url &mdash; it suggests as you type</div>
     <div class="k"><kbd>&#8984; T</kbd></div>       <div>new tab &mdash; the tab bar shows up from the second one</div>
+    <div class="k"><kbd>&#8679;&#8984; T</kbd></div><div>reopen a closed tab &mdash; right-click a tab for more</div>
     <div class="k"><kbd>&#8963;&#8677;</kbd></div>  <div>next tab &mdash; <kbd>&#8984;1</kbd>&hellip;<kbd>&#8984;9</kbd> jump straight there</div>
+    <div class="k"><kbd>&#8679;&#8984; N</kbd></div><div>private window &mdash; nothing is saved</div>
+    <div class="k"><kbd>&#8984; F</kbd></div>       <div>find in page &mdash; <kbd>&#8984;G</kbd> <kbd>&#8679;&#8984;G</kbd> walk the matches</div>
     <div class="k"><kbd>&#8984; drag</kbd></div>    <div>move the window</div>
     <div class="k"><kbd>&#8984; click</kbd></div>   <div>open a link in a background tab &mdash; middle-click too, <kbd>&#8679;&#8984;</kbd> to jump there</div>
     <div class="k"><kbd>&#8963;&#8984; F</kbd></div><div>fullscreen</div>
@@ -498,6 +507,7 @@ private let startPageTemplate = #"""
     <div class="grid" id="qa-grid"></div>
   </section>
   <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
+  <br>hover a link and its address shows bottom-left &nbsp;&middot;&nbsp; sites that ask for camera, mic, location, or notifications get a real prompt now
   <br>quick access: click a tile to go, &#8984;-click for a background tab, &#9998; to edit &mdash; icons fetch themselves
   <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b>
   <br>ai sidebar: add a provider &mdash; openrouter, chatgpt, gemini, claude, ollama&hellip; &mdash; and its models in <b>View &rsaquo; AI Settings</b>, then <kbd>&#8679;&#8984;A</kbd> asks about the page you are on
@@ -708,6 +718,9 @@ final class BrowserWebView: WKWebView {
     // shortcut. Bare Esc deliberately does nothing here: it used to jump back
     // to the start page, which threw away whatever was typed into the page.
     var onQuickAccess: ((BrowserWebView, [String: Any]) -> Void)?
+    // Fed by `LinkHoverRouter` as the pointer moves over anchors: the link's
+    // href, or nil when the pointer is no longer on one.
+    var onLinkHover: ((URL?) -> Void)?
 
     // ⌘ is overloaded: ⌘-drag moves the window, ⌘-click opens the link under
     // the cursor in a new tab. Which one it is is not knowable at mouse-down,
@@ -853,6 +866,129 @@ private let auxClickScript = """
 })();
 """
 
+// With no status bar there is no way to see where a link goes before clicking
+// it. The page reports the anchor under the pointer — or "" once there is none
+// — and the app draws it in a corner bubble. One post per change, so dragging
+// the pointer across the page does not stream messages.
+private let linkHoverScript = """
+(function () {
+  var last = null;
+  function hrefFor(e) {
+    var n = e.target;
+    while (n && n.nodeType === 1) {
+      if (n.tagName === "A" && n.href) return n.href;
+      n = n.parentNode;
+    }
+    return null;
+  }
+  document.addEventListener("mouseover", function (e) {
+    var h = hrefFor(e);
+    if (h === last) return;
+    last = h;
+    window.webkit.messageHandlers.chromelessLinkHover.postMessage(h || "");
+  }, true);
+  document.addEventListener("mouseleave", function () {
+    if (last === null) return;
+    last = null;
+    window.webkit.messageHandlers.chromelessLinkHover.postMessage("");
+  }, true);
+})();
+"""
+
+// The ⌘F engine. Kept on the world's own `window` so it survives between calls
+// on the same page; a navigation drops it with the rest of the page's globals.
+// Hits are text-node ranges — matches that span elements are not found, and
+// inputs/textareas are skipped on purpose. Selection is the highlight: moving
+// to a hit selects it and scrolls it into view.
+private let findEngineScript = """
+window.__clf = window.__clf || (function () {
+  var hits = [], idx = -1;
+  function searchable(n) {
+    for (var e = n.parentElement; e; e = e.parentElement) {
+      var t = e.tagName;
+      if (t === "SCRIPT" || t === "STYLE" || t === "NOSCRIPT" || t === "TEXTAREA") return false;
+    }
+    return true;
+  }
+  function paint() {
+    var sel = window.getSelection();
+    sel.removeAllRanges();
+    if (idx < 0 || idx >= hits.length) return;
+    try {
+      var h = hits[idx], r = document.createRange();
+      r.setStart(h[0], h[1]); r.setEnd(h[0], h[2]);
+      sel.addRange(r);
+      var rect = r.getBoundingClientRect();
+      if (rect.bottom < 0 || rect.top > window.innerHeight ||
+          rect.right < 0 || rect.left > window.innerWidth)
+        r.startContainer.parentElement.scrollIntoView({ block: "center", inline: "nearest" });
+    } catch (e) {}
+  }
+  return {
+    scan: function (term) {
+      hits = []; idx = -1;
+      if (!term) { paint(); return 0; }
+      var needle = term.toLowerCase();
+      var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+        acceptNode: function (n) {
+          return n.nodeValue && n.nodeValue.toLowerCase().indexOf(needle) !== -1 && searchable(n)
+            ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+        }
+      });
+      var node;
+      while ((node = w.nextNode())) {
+        var s = node.nodeValue.toLowerCase(), i = 0;
+        while ((i = s.indexOf(needle, i)) !== -1) {
+          hits.push([node, i, i + needle.length]);
+          i += needle.length;
+        }
+      }
+      return hits.length;
+    },
+    // Jump to the i-th hit, wrapping around. The caller rescans before every
+    // jump, because the DOM may have moved since the last one.
+    at: function (i) {
+      if (!hits.length) { idx = -1; paint(); return -1; }
+      idx = ((i % hits.length) + hits.length) % hits.length;
+      paint();
+      return idx;
+    },
+    clear: function () { hits = []; idx = -1; paint(); }
+  };
+})();
+"""
+
+// Heavyweight interactive apps — remote desktops, live terminals — benefit
+// from treatment a normal page should not get. Anything here is granted by
+// host only, so a random site never earns the same freedom.
+private struct SiteTweaks {
+    /// Hold off App Nap, idle sleep, and display sleep while the site is the
+    /// active tab of a visible window — a remote session must not freeze
+    /// because the local screen went dark.
+    var keepAwake = false
+    /// Present a Chrome user agent. Some Google apps serve a faster path to
+    /// Chrome — or a Chrome-only one; if the site misbehaves, flip this off.
+    var chromeUserAgent = false
+    /// Keep the page fully alive in the background: no window-occlusion
+    /// suspension (video keeps painting under a covered or minimized window)
+    /// and no DOM timer throttling in a non-front tab. Costs idle CPU/GPU —
+    /// that is the trade, and it is why it is per site.
+    var backgroundWork = false
+}
+
+private let siteTweaks: [String: SiteTweaks] = [
+    "remotedesktop.google.com": SiteTweaks(
+        keepAwake: true, chromeUserAgent: true, backgroundWork: true),
+    "orca-win.haiho.net": SiteTweaks(
+        keepAwake: true, backgroundWork: true),
+]
+
+// A recent desktop Chrome on macOS — generic enough to pass a UA check
+// without promising a WebKit feature the site might then call.
+private let chromeUserAgentString =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36"
+
 /// Where the scripts this app injects live, and where their message handlers are
 /// registered. A page cannot see `window.webkit.messageHandlers` entries from
 /// another content world, so it cannot post to them — which matters because these
@@ -878,9 +1014,24 @@ final class AuxClickRouter: NSObject, WKScriptMessageHandler {
     }
 }
 
-func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration {
+// Routes the link-hover script's messages to the web view they came from.
+final class LinkHoverRouter: NSObject, WKScriptMessageHandler {
+    static let shared = LinkHoverRouter()
+    static let messageName = "chromelessLinkHover"
+
+    func userContentController(_ controller: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        guard let webView = message.webView as? BrowserWebView,
+              let href = message.body as? String else { return }
+        webView.onLinkHover?(href.isEmpty ? nil : URL(string: href))
+    }
+}
+
+func makeWebConfiguration(for profile: BrowserProfile, isPrivate: Bool = false) -> WKWebViewConfiguration {
     let conf = WKWebViewConfiguration()
-    conf.websiteDataStore = profileStore.websiteDataStore(for: profile)
+    conf.websiteDataStore = isPrivate
+        ? .nonPersistent()
+        : profileStore.websiteDataStore(for: profile)
     conf.preferences.isElementFullscreenEnabled = true
     // `isInspectable` only unlocks the context menu's Inspect Element. Driving
     // the inspector from code needs WebKit's developer extras as well — the bit
@@ -903,11 +1054,16 @@ func makeWebConfiguration(for profile: BrowserProfile) -> WKWebViewConfiguration
                                    name: AuxClickRouter.messageName)
     conf.userContentController.add(AdBlockPickerRouter.shared, contentWorld: chromelessWorld,
                                    name: AdBlockPickerRouter.messageName)
+    conf.userContentController.add(LinkHoverRouter.shared, contentWorld: chromelessWorld,
+                                   name: LinkHoverRouter.messageName)
     // The start page is a page, so its bridge has to be in the page world. What
     // keeps another site out is the nonce it carries — see `handleQuickAccess`.
     conf.userContentController.add(QuickAccessRouter.shared, name: QuickAccessRouter.messageName)
     conf.userContentController.addUserScript(WKUserScript(
         source: auxClickScript, injectionTime: .atDocumentStart, forMainFrameOnly: false,
+        in: chromelessWorld))
+    conf.userContentController.addUserScript(WKUserScript(
+        source: linkHoverScript, injectionTime: .atDocumentStart, forMainFrameOnly: false,
         in: chromelessWorld))
     if !hasPasskeyEntitlement {
         let hideWebAuthn = WKUserScript(
@@ -944,6 +1100,10 @@ final class Tab {
     /// What the start page in this tab must quote back for its bridge to be
     /// listened to. Nil for a tab showing a website, which is the point.
     var startPageNonce: String?
+    /// The tab bar's icon and the host it belongs to. The host is tracked so
+    /// same-site navigations do not refetch, and a different site clears it.
+    var favicon: NSImage?
+    var faviconHost: String?
 
     init(webView: BrowserWebView) { self.webView = webView }
 
@@ -971,9 +1131,11 @@ final class TabItemView: NSView {
     var onSelect: ((TabItemView) -> Void)?
     var onClose: ((TabItemView) -> Void)?
     var onDragBegin: ((TabItemView, NSEvent) -> Void)?
+    var onMenu: ((TabItemView) -> NSMenu?)?
 
     var index = 0
 
+    private let iconView = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private let closeButton = NSButton()
     private var hovering = false
@@ -988,12 +1150,26 @@ final class TabItemView: NSView {
             needsLayout = true
         }
     }
+    var icon: NSImage? {
+        didSet {
+            iconView.image = icon
+            iconView.isHidden = icon == nil
+            needsLayout = true
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 7
         layer?.cornerCurve = .continuous
+
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.isHidden = true
+        iconView.wantsLayer = true
+        iconView.layer?.cornerRadius = 3
+        iconView.layer?.masksToBounds = true
+        addSubview(iconView)
 
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.lineBreakMode = .byTruncatingTail
@@ -1066,6 +1242,13 @@ final class TabItemView: NSView {
         onDragBegin?(self, event)
     }
 
+    // Right-click selects too, then asks the bar for the context menu — a menu
+    // that acts on a tab it is not attached to reads like a bug.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        onSelect?(self)
+        return onMenu?(self)
+    }
+
     // Middle-click closes, but only on release and only if the cursor never
     // left the tab — sliding off before letting go cancels, the way it does for
     // every other destructive click on macOS.
@@ -1086,9 +1269,11 @@ final class TabItemView: NSView {
         super.layout()
         let b = bounds
         closeButton.frame = NSRect(x: b.width - 20, y: (b.height - 16) / 2, width: 16, height: 16)
+        iconView.frame = NSRect(x: 8, y: (b.height - 14) / 2, width: 14, height: 14)
+        let labelX: CGFloat = iconView.isHidden ? 9 : 27
         let labelRight: CGFloat = closeButton.isHidden ? 8 : 22
-        label.frame = NSRect(x: 9, y: (b.height - 15) / 2,
-                             width: max(0, b.width - 9 - labelRight), height: 15)
+        label.frame = NSRect(x: labelX, y: (b.height - 15) / 2,
+                             width: max(0, b.width - labelX - labelRight), height: 15)
     }
 }
 
@@ -1102,6 +1287,7 @@ final class TabBarView: NSVisualEffectView {
     var onClose: ((Int) -> Void)?
     var onNewTab: (() -> Void)?
     var onReorder: ((Int, Int) -> Void)?
+    var onContextMenu: ((Int) -> NSMenu?)?
 
     private var items: [TabItemView] = []
     private let addButton = NSButton()
@@ -1161,6 +1347,7 @@ final class TabBarView: NSVisualEffectView {
             item.onSelect = { [weak self] in self?.onSelect?($0.index) }
             item.onClose = { [weak self] in self?.onClose?($0.index) }
             item.onDragBegin = { [weak self] in self?.beginDrag($0, with: $1) }
+            item.onMenu = { [weak self] in self?.onContextMenu?($0.index) }
             addSubview(item, positioned: .below, relativeTo: addButton)
             items.append(item)
         }
@@ -1175,6 +1362,11 @@ final class TabBarView: NSVisualEffectView {
     func update(titleAt index: Int?, to title: String) {
         guard let index, items.indices.contains(index) else { return }
         items[index].title = title
+    }
+
+    func update(iconAt index: Int?, to icon: NSImage?) {
+        guard let index, items.indices.contains(index) else { return }
+        items[index].icon = icon
     }
 
     func setChipWidth(_ width: CGFloat) {
@@ -1297,15 +1489,38 @@ final class TabBarView: NSVisualEffectView {
 // MARK: - Browser window
 
 final class BrowserWindowController: NSWindowController, NSWindowDelegate,
-    WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate, NSMenuItemValidation {
+    WKNavigationDelegate, WKUIDelegate, NSTextFieldDelegate, NSMenuItemValidation,
+    NSTableViewDataSource, NSTableViewDelegate {
 
     private(set) var tabs: [Tab] = []
     private(set) var activeIndex = 0
     private let profile: BrowserProfile
+    /// A private window runs on a non-persistent data store and records nothing:
+    /// no history, no last page. Downloads still land on disk — they are files
+    /// the user asked for, not browsing data.
+    let isPrivate: Bool
     private let tabBar = TabBarView()
     private let progressBar = NSView()
     private let hud = NSVisualEffectView()
     private let hudField = NSTextField()
+    private let suggestPanel = NSVisualEffectView()
+    private let suggestTable = NSTableView()
+    private var suggestions: [(title: String?, url: String, icon: NSImage?)] = []
+    private var suggestIconCache: [String: NSImage] = [:]
+    private let findBar = NSVisualEffectView()
+    private let findField = NSTextField()
+    private let findCountLabel = NSTextField(labelWithString: "")
+    private var findButtons: [NSButton] = []
+    private var findIndex = -1
+    private var findDebounce: DispatchWorkItem?
+    private let linkHoverView = NSVisualEffectView()
+    private let linkHoverLabel = NSTextField(labelWithString: "")
+    private var closedTabs: [URL] = []
+    private var faviconCache: [String: NSImage] = [:]
+    private var keepAwakeActivity: NSObjectProtocol?
+    private var permissionChoices: [String: Bool] = [:]
+    private var permissionQueue: [() -> Void] = []
+    private var permissionPromptUp = false
     private let toastView = NSVisualEffectView()
     private let toastLabel = NSTextField(labelWithString: "")
     private let profileBadge = ProfileChipView()
@@ -1350,10 +1565,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var aiSidebarSpan: CGFloat { aiSidebarShown ? aiSidebarWidth : 0 }
     private var aiChipWidth: CGFloat { AIButtonPreference.isOn ? 32 : 0 }
 
-    init(profile: BrowserProfile, url: URL?, size: NSSize?, snap: SnapJob?, isPrimary: Bool) {
+    init(profile: BrowserProfile, url: URL?, size: NSSize?, snap: SnapJob?,
+         isPrimary: Bool, isPrivate: Bool = false) {
         self.profile = profile
+        self.isPrivate = isPrivate
         tabs = [Tab(webView: BrowserWebView(
-            frame: .zero, configuration: makeWebConfiguration(for: profile)))]
+            frame: .zero, configuration: makeWebConfiguration(for: profile, isPrivate: isPrivate)))]
         snapJob = snap
 
         let contentSize = size ?? NSSize(width: 1160, height: 760)
@@ -1363,7 +1580,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             backing: .buffered, defer: false)
         super.init(window: window)
 
-        window.title = "Chromeless - \(profile.name)"
+        window.title = "Chromeless - \(isPrivate ? "Private" : profile.name)"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -1400,6 +1617,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         installKeyMonitor()
 
         if let url { navigate(to: url) } else { loadStartPage() }
+        preconnectFrequentHosts()
         if snap == nil && !profileStore.usesPersistentProfileStores {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
                 self?.showToast("Profiles are private on macOS 13; persistent profiles need macOS 14")
@@ -1417,6 +1635,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         wv.onQuickAccess = { [weak self] source, body in self?.handleQuickAccess(body, from: source) }
         wv.onOpenLinkInNewTab = { [weak self] url, background in
             _ = self?.addTab(url: url, activate: !background)
+        }
+        // Only the front tab's hover is drawn — a background tab's pointer is
+        // not moving anyway, and drawing its link over this page would lie.
+        wv.onLinkHover = { [weak self, weak wv] url in
+            guard let self, let wv, self.tab(for: wv) === self.activeTab else { return }
+            self.setLinkHover(url)
         }
         wv.onPickedSelector = { [weak self] selector in
             guard let self else { return }
@@ -1443,7 +1667,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     // or target=_blank; in that case WebKit drives the load itself.
     @discardableResult
     func addTab(url: URL?, configuration: WKWebViewConfiguration? = nil, activate: Bool = true) -> Tab {
-        let conf = configuration ?? makeWebConfiguration(for: profile)
+        let conf = configuration ?? makeWebConfiguration(for: profile, isPrivate: isPrivate)
         let tab = Tab(webView: BrowserWebView(frame: .zero, configuration: conf))
         configure(tab)
         tabs.append(tab)
@@ -1457,15 +1681,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func selectTab(at index: Int) {
         guard tabs.indices.contains(index), index != activeIndex else { return }
+        // Clears the find highlight on the tab being left, before it goes.
+        hideFindBar()
         activeIndex = index
         refreshTabs()
     }
 
-    func closeTab(at index: Int) {
+    func closeTab(at index: Int, recordClosed: Bool = true) {
         guard tabs.indices.contains(index) else { return }
         // Closing the only tab closes the window, so ⌘W keeps its old meaning.
         if tabs.count == 1 { window?.performClose(nil); return }
+        if index == activeIndex { hideFindBar() }
         let tab = tabs.remove(at: index)
+        // The URL is all a reopen gets back — the page's own back-forward list
+        // dies with the web view.
+        if recordClosed { recordClosedTab(tab) }
         tab.teardown()
         if activeIndex >= tabs.count {
             activeIndex = tabs.count - 1
@@ -1500,7 +1730,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             container.addSubview(activeTab.webView, positioned: .below, relativeTo: tabBar)
         }
         tabBar.rebuild(titles: tabs.map(\.displayTitle), activeIndex: activeIndex)
+        for (index, tab) in tabs.enumerated() {
+            tabBar.update(iconAt: index, to: tab.favicon)
+        }
         tabBar.isHidden = !tabBarVisible
+        // The bubble belongs to the page it hovered over, not the window.
+        setLinkHover(nil)
+        refreshKeepAwake()
         // The tab bar sits in the titlebar strip, which the WindowServer claims
         // as a window-drag region from outside this process. No view-level
         // property gets it back — `mouseDownCanMoveWindow` is simply ignored
@@ -1536,7 +1772,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     private func syncWindowTitle() {
         let t = activeTab.webView.title ?? ""
-        window?.title = "\(t.isEmpty ? "Chromeless" : t) - \(profile.name)"
+        let suffix = isPrivate ? "Private" : profile.name
+        window?.title = "\(t.isEmpty ? "Chromeless" : t) - \(suffix)"
     }
 
     // MARK: Chrome (what little there is)
@@ -1560,7 +1797,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 self.setTrafficLights(visible: self.isFullScreen || nearCorner)
             } else if !self.hud.isHidden {
                 let p = self.window!.contentView!.convert(event.locationInWindow, from: nil)
-                if !self.hud.frame.contains(p) { self.hideHUD() }
+                // The suggestion panel is part of the address-bar interaction —
+                // clicking a row must not close the HUD before the click lands.
+                if !self.hud.frame.contains(p) && !self.suggestPanel.frame.contains(p) {
+                    self.hideHUD()
+                }
             }
             return event
         }
@@ -1600,6 +1841,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onNewTab = { [weak self] in self?.addTab(url: nil) }
         tabBar.onReorder = { [weak self] from, to in self?.moveTab(from: from, to: to) }
+        tabBar.onContextMenu = { [weak self] i in self?.buildTabContextMenu(for: i) }
         tabBar.isHidden = true
         container.addSubview(tabBar)
 
@@ -1633,6 +1875,97 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         hud.addSubview(hudField)
         container.addSubview(hud)
 
+        // The suggestion panel rides under the HUD like the suggestions ride
+        // under a normal address bar: same width, same left edge.
+        suggestPanel.material = .hudWindow
+        suggestPanel.blendingMode = .withinWindow
+        suggestPanel.state = .active
+        suggestPanel.wantsLayer = true
+        suggestPanel.layer?.cornerRadius = 12
+        suggestPanel.layer?.cornerCurve = .continuous
+        suggestPanel.layer?.masksToBounds = true
+        suggestPanel.layer?.borderWidth = 1
+        suggestPanel.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        suggestPanel.isHidden = true
+        suggestPanel.alphaValue = 0
+        suggestTable.headerView = nil
+        suggestTable.rowHeight = 28
+        suggestTable.intercellSpacing = NSSize(width: 0, height: 2)
+        suggestTable.backgroundColor = .clear
+        suggestTable.selectionHighlightStyle = .regular
+        suggestTable.dataSource = self
+        suggestTable.delegate = self
+        suggestTable.target = self
+        suggestTable.action = #selector(openSelectedSuggestion(_:))
+        suggestTable.addTableColumn(NSTableColumn(identifier: NSUserInterfaceItemIdentifier("s")))
+        suggestPanel.addSubview(suggestTable)
+        container.addSubview(suggestPanel)
+
+        // ⌘F. A smaller HUD: field, n/m counter, prev/next/close.
+        findBar.material = .hudWindow
+        findBar.blendingMode = .withinWindow
+        findBar.state = .active
+        findBar.wantsLayer = true
+        findBar.layer?.cornerRadius = 17
+        findBar.layer?.cornerCurve = .continuous
+        findBar.layer?.masksToBounds = true
+        findBar.layer?.borderWidth = 1
+        findBar.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        findBar.isHidden = true
+        findBar.alphaValue = 0
+        findField.isBezeled = false
+        findField.isBordered = false
+        findField.drawsBackground = false
+        findField.focusRingType = .none
+        findField.font = .systemFont(ofSize: 13)
+        findField.textColor = .labelColor
+        findField.placeholderString = "Find in page"
+        findField.usesSingleLineMode = true
+        findField.cell?.isScrollable = true
+        findField.cell?.wraps = false
+        findField.delegate = self
+        findBar.addSubview(findField)
+        findCountLabel.font = .systemFont(ofSize: 11)
+        findCountLabel.textColor = .secondaryLabelColor
+        findCountLabel.alignment = .right
+        findBar.addSubview(findCountLabel)
+        for (title, tip, action) in [
+            ("‹", "Previous (⇧↩)", #selector(findPreviousAction(_:))),
+            ("›", "Next (↩)", #selector(findNextAction(_:))),
+            ("✕", "Close (esc)", #selector(hideFindBarAction(_:))),
+        ] {
+            let b = NSButton()
+            b.isBordered = false
+            b.bezelStyle = .inline
+            b.title = title
+            b.font = .systemFont(ofSize: 13, weight: .medium)
+            b.contentTintColor = .secondaryLabelColor
+            b.toolTip = tip
+            b.target = self
+            b.action = action
+            findBar.addSubview(b)
+            findButtons.append(b)
+        }
+        container.addSubview(findBar)
+
+        linkHoverView.material = .hudWindow
+        linkHoverView.blendingMode = .withinWindow
+        linkHoverView.state = .active
+        linkHoverView.wantsLayer = true
+        // Flush against the bottom-left corner like a real status bar — only
+        // the top-right edge rounds off.
+        linkHoverView.layer?.cornerRadius = 8
+        linkHoverView.layer?.cornerCurve = .continuous
+        linkHoverView.layer?.maskedCorners = [.layerMaxXMaxYCorner]
+        linkHoverView.layer?.masksToBounds = true
+        linkHoverView.isHidden = true
+        linkHoverView.alphaValue = 0
+        linkHoverLabel.font = .systemFont(ofSize: 11)
+        linkHoverLabel.textColor = .secondaryLabelColor
+        linkHoverLabel.lineBreakMode = .byTruncatingMiddle
+        linkHoverView.addSubview(linkHoverLabel)
+        container.addSubview(linkHoverView)
+
         toastView.material = .hudWindow
         toastView.blendingMode = .withinWindow
         toastView.state = .active
@@ -1655,11 +1988,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         profileBadge.layer?.cornerCurve = .continuous
         profileBadge.layer?.masksToBounds = true
         profileBadge.alphaValue = 0.82
-        profileLabel.stringValue = profile.name
+        profileLabel.stringValue = isPrivate ? "Private" : profile.name
         profileLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         profileLabel.textColor = .labelColor
         profileLabel.lineBreakMode = .byTruncatingTail
-        profileBadge.toolTip = "Profile — click to switch"
+        profileBadge.toolTip = isPrivate
+            ? "Private window — nothing is saved"
+            : "Profile — click to switch"
         profileBadge.onClick = { [weak self] in
             guard let self else { return }
             (NSApp.delegate as? AppDelegate)?.presentProfilePicker(from: self)
@@ -1971,6 +2306,38 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                            width: hudW, height: hudH)
         hudField.frame = NSRect(x: 20, y: (hudH - 22) / 2, width: hudW - 40, height: 22)
 
+        // Suggestions hang off the HUD's bottom edge, as tall as the list —
+        // never scrolled, since the cap is eight rows.
+        let sgH = suggestions.isEmpty ? 0 : CGFloat(suggestions.count) * suggestTable.rowHeight + 8
+        suggestPanel.frame = NSRect(x: hud.frame.minX,
+                                    y: hud.frame.minY - 6 - sgH,
+                                    width: hudW, height: sgH)
+        suggestTable.frame = NSRect(x: 4, y: 4, width: max(0, hudW - 8), height: max(0, sgH - 8))
+
+        // ⌘F docks top-right under the tab bar — where browsers put it.
+        let fbW = min(320, max(240, pageWidth * 0.42))
+        let fbH: CGFloat = 34
+        findBar.frame = NSRect(x: pageWidth - fbW - 14,
+                               y: b.height - barH - fbH - 8,
+                               width: fbW, height: fbH)
+        var fbRight = fbW - 8
+        for button in findButtons.reversed() {
+            fbRight -= 24
+            button.frame = NSRect(x: fbRight, y: (fbH - 20) / 2, width: 24, height: 20)
+        }
+        findCountLabel.sizeToFit()
+        let countW = min(72, findCountLabel.frame.width)
+        findCountLabel.frame = NSRect(x: fbRight - countW - 4, y: (fbH - 14) / 2,
+                                      width: countW, height: 14)
+        findField.frame = NSRect(x: 14, y: (fbH - 20) / 2,
+                                 width: max(60, findCountLabel.frame.minX - 20), height: 20)
+
+        // The link-hover bubble hugs the bottom-left corner, like a status bar.
+        linkHoverLabel.sizeToFit()
+        let lhW = min(max(140, linkHoverLabel.frame.width + 24), max(140, pageWidth * 0.62))
+        linkHoverView.frame = NSRect(x: 0, y: 0, width: lhW, height: 24)
+        linkHoverLabel.frame = NSRect(x: 12, y: 5, width: lhW - 24, height: 14)
+
         toastLabel.sizeToFit()
         let ts = toastLabel.frame.size
         let tw = ts.width + 32
@@ -2060,10 +2427,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 self.tabBar.update(titleAt: self.tabs.firstIndex { $0 === tab }, to: tab.displayTitle)
                 if tab === self.activeTab { self.syncWindowTitle() }
             },
-            tab.webView.observe(\.url) { [profile] wv, _ in
-                if let u = wv.url, u.scheme == "https" || u.scheme == "http" {
-                    profileStore.recordVisit(u, for: profile)
+            tab.webView.observe(\.url) { [weak self, weak tab] wv, _ in
+                guard let self, let tab else { return }
+                if !self.isPrivate, let u = wv.url, u.scheme == "https" || u.scheme == "http" {
+                    profileStore.recordVisit(u, for: self.profile)
                 }
+                self.updateFavicon(for: tab, url: wv.url)
             },
         ]
     }
@@ -2230,29 +2599,610 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             hud.animator().alphaValue = 1
         }
         hudField.selectText(nil)
+        rebuildSuggestions()
     }
 
     func hideHUD() {
+        suggestions = []
+        suggestPanel.isHidden = true
+        suggestPanel.alphaValue = 0
+        suggestTable.deselectAll(nil)
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.15
             self.hud.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
             guard let self else { return }
             self.hud.isHidden = true
-            self.window?.makeFirstResponder(self.webView)
+            // Hand the page its focus back — unless another overlay's field
+            // claimed it while the fade ran (⌘F opens the find bar mid-fade).
+            if !(self.window?.firstResponder is NSTextView) {
+                self.window?.makeFirstResponder(self.webView)
+            }
         })
     }
 
     private func commitHUD() {
+        // A picked suggestion wins over whatever is typed — that is what the
+        // arrows are for.
+        if let url = pickedSuggestionURL() {
+            hideHUD()
+            navigate(to: url)
+            return
+        }
         let text = hudField.stringValue
         hideHUD()
         if let url = smartURL(text) { navigate(to: url) }
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if control === findField {
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) { hideFindBar(); return true }
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                // The same field, the same two directions as every browser.
+                stepFind(NSApp.currentEvent?.modifierFlags.contains(.shift) == true ? -1 : 1)
+                return true
+            }
+            return false
+        }
+        guard control === hudField else { return false }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) { hideHUD(); return true }
         if commandSelector == #selector(NSResponder.insertNewline(_:)) { commitHUD(); return true }
+        if commandSelector == #selector(NSResponder.moveDown(_:)) { moveSuggestion(1); return true }
+        if commandSelector == #selector(NSResponder.moveUp(_:)) { moveSuggestion(-1); return true }
         return false
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let control = obj.object as? NSControl else { return }
+        if control === hudField {
+            rebuildSuggestions()
+        } else if control === findField {
+            // Rescanning on every keystroke is cheap for normal pages; the
+            // short debounce keeps pathological ones from stalling the field.
+            findDebounce?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                self?.performFind(target: 0)
+            }
+            findDebounce = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+        }
+    }
+
+    // MARK: HUD suggestions
+
+    /// Quick-access tiles first — they are the sites the user chose — then the
+    /// profile's recorded history, newest visit first. An empty field lists
+    /// the tiles alone, so ⌘L ↓ ↩ is a jump to any of them.
+    private func rebuildSuggestions() {
+        let q = hudField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var out: [(title: String?, url: String, icon: NSImage?)] = []
+        var seen = Set<String>()
+        func add(_ title: String?, _ url: String, _ icon: NSImage?) {
+            if out.count < 8, seen.insert(url).inserted { out.append((title, url, icon)) }
+        }
+        for link in quickAccessStore.links
+        where q.isEmpty || link.title.lowercased().contains(q) || link.url.lowercased().contains(q) {
+            add(link.title, link.url, suggestionIcon(for: link))
+        }
+        if !q.isEmpty {
+            for u in profile.history.reversed() where u.lowercased().contains(q) {
+                add(nil, u, nil)
+            }
+        }
+        suggestions = out
+        suggestTable.reloadData()
+        suggestTable.deselectAll(nil)
+        layoutOverlays()
+        let show = !hud.isHidden && !suggestions.isEmpty
+        suggestPanel.isHidden = !show
+        suggestPanel.alphaValue = show ? 1 : 0
+    }
+
+    private func suggestionIcon(for link: QuickLink) -> NSImage? {
+        if let cached = suggestIconCache[link.id] { return cached }
+        guard let image = imageFromDataURI(link.icon) else { return nil }
+        suggestIconCache[link.id] = image
+        return image
+    }
+
+    private func imageFromDataURI(_ s: String?) -> NSImage? {
+        guard let s, let comma = s.firstIndex(of: ","),
+              s[..<comma].contains("base64"),
+              let data = Data(base64Encoded: String(s[s.index(after: comma)...])),
+              let image = NSImage(data: data) else { return nil }
+        return image
+    }
+
+    /// ↓/↑ inside the HUD walk the list; the walk stops at the ends rather
+    /// than wrapping, matching the address bars everyone is used to.
+    private func moveSuggestion(_ delta: Int) {
+        guard !suggestions.isEmpty else { return }
+        let row = suggestTable.selectedRow
+        let next = row < 0
+            ? (delta > 0 ? 0 : suggestions.count - 1)
+            : min(max(row + delta, 0), suggestions.count - 1)
+        guard next != row else { return }
+        suggestTable.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+        suggestTable.scrollRowToVisible(next)
+    }
+
+    private func pickedSuggestionURL() -> URL? {
+        let row = suggestTable.selectedRow
+        guard !suggestPanel.isHidden, suggestions.indices.contains(row),
+              let url = URL(string: suggestions[row].url) else { return nil }
+        return url
+    }
+
+    @objc func openSelectedSuggestion(_ sender: Any?) {
+        let row = suggestTable.clickedRow >= 0 ? suggestTable.clickedRow : suggestTable.selectedRow
+        openSuggestion(at: row)
+    }
+
+    private func openSuggestion(at row: Int) {
+        guard suggestions.indices.contains(row),
+              let url = URL(string: suggestions[row].url) else { return }
+        hideHUD()
+        navigate(to: url)
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { suggestions.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard suggestions.indices.contains(row) else { return nil }
+        let s = suggestions[row]
+        let cell = NSTableCellView(frame: NSRect(x: 0, y: 0, width: tableView.frame.width, height: 28))
+
+        let iconView = NSImageView(frame: NSRect(x: 10, y: 6, width: 16, height: 16))
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.wantsLayer = true
+        iconView.layer?.cornerRadius = 3
+        iconView.layer?.masksToBounds = true
+        if let icon = s.icon {
+            iconView.image = icon
+        } else {
+            // History entries carry no artwork; the generic mark keeps the
+            // row's left edge aligned with the tiles that do.
+            iconView.image = NSImage(systemSymbolName: "globe", accessibilityDescription: nil)
+            iconView.contentTintColor = .secondaryLabelColor
+        }
+        cell.addSubview(iconView)
+
+        // Title in the foreground, address dimmed after it — and for history,
+        // which has no title, the address is all there is.
+        let attr = NSMutableAttributedString()
+        if let title = s.title, !title.isEmpty {
+            attr.append(NSAttributedString(string: title, attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5, weight: .medium),
+                .foregroundColor: NSColor.labelColor]))
+            attr.append(NSAttributedString(string: "  —  ", attributes: [
+                .font: NSFont.systemFont(ofSize: 12.5),
+                .foregroundColor: NSColor.tertiaryLabelColor]))
+        }
+        attr.append(NSAttributedString(string: s.url, attributes: [
+            .font: NSFont.systemFont(ofSize: 12.5),
+            .foregroundColor: (s.title?.isEmpty == false) ? NSColor.secondaryLabelColor : NSColor.labelColor]))
+        let text = NSTextField(labelWithString: "")
+        text.attributedStringValue = attr
+        text.lineBreakMode = .byTruncatingTail
+        text.frame = NSRect(x: 34, y: 5, width: max(60, tableView.frame.width - 44), height: 18)
+        text.autoresizingMask = [.width]
+        cell.addSubview(text)
+        cell.textField = text
+        return cell
+    }
+
+    // MARK: Find in page (⌘F)
+
+    @objc func findInPageAction(_ sender: Any?) {
+        if !findBar.isHidden {
+            window?.makeFirstResponder(findField)
+            findField.selectText(nil)
+            return
+        }
+        // The field opens with the page's current selection, the way every
+        // other find bar does.
+        webView.evaluateJavaScript("window.getSelection().toString()", in: nil,
+                                   in: chromelessWorld) { [weak self] result in
+            guard let self else { return }
+            if case .success(let value) = result, let text = value as? String, !text.isEmpty {
+                self.findField.stringValue = String(text.prefix(200))
+            }
+            self.presentFindBar()
+        }
+    }
+
+    private func presentFindBar() {
+        // Two floating fields at once is one too many.
+        hideHUD()
+        findBar.isHidden = false
+        layoutOverlays()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.15
+            findBar.animator().alphaValue = 1
+        }
+        window?.makeFirstResponder(findField)
+        findField.selectText(nil)
+        if !findField.stringValue.isEmpty { performFind(target: 0) }
+    }
+
+    func hideFindBar() {
+        guard !findBar.isHidden else { return }
+        clearFindInPage()
+        findIndex = -1
+        findCountLabel.stringValue = ""
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.15
+            self.findBar.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            self?.findBar.isHidden = true
+        })
+        window?.makeFirstResponder(webView)
+    }
+
+    @objc func hideFindBarAction(_ sender: Any?) { hideFindBar() }
+
+    @objc func findNextAction(_ sender: Any?) { stepFind(1) }
+    @objc func findPreviousAction(_ sender: Any?) { stepFind(-1) }
+
+    private func stepFind(_ delta: Int) {
+        guard !findField.stringValue.isEmpty else { return }
+        if findBar.isHidden { presentFindBar() }
+        performFind(target: findIndex + delta)
+    }
+
+    /// Rescans the term and jumps to `target`. Every call rescans because the
+    /// DOM may have shifted since the last one — a stale node range is worse
+    /// than a wasted walk.
+    private func performFind(target: Int) {
+        let term = findField.stringValue
+        guard !term.isEmpty else {
+            clearFindInPage()
+            updateFindLabel(index: -1, count: 0)
+            return
+        }
+        let js = findEngineScript
+            + "\n;(function(){var c=window.__clf,n=c.scan(\(jsStringLiteral(term)));"
+            + "var i=c.at(\(target));return i+'/'+n;})()"
+        webView.evaluateJavaScript(js, in: nil, in: chromelessWorld) { [weak self] result in
+            var index = -1, count = 0
+            if case .success(let value) = result, let s = value as? String {
+                let parts = s.split(separator: "/").compactMap { Int($0) }
+                if parts.count == 2 { index = parts[0]; count = parts[1] }
+            }
+            self?.updateFindLabel(index: index, count: count)
+        }
+    }
+
+    private func clearFindInPage() {
+        webView.evaluateJavaScript(findEngineScript + "\n;window.__clf.clear();",
+                                   in: nil, in: chromelessWorld, completionHandler: nil)
+    }
+
+    private func updateFindLabel(index: Int, count: Int) {
+        findIndex = index
+        findCountLabel.stringValue = findField.stringValue.isEmpty ? ""
+            : count == 0 ? "No results"
+            : "\(index + 1)/\(count)"
+        layoutOverlays()
+    }
+
+    /// A JS string literal for `term`, escaping handled by the JSON encoder.
+    private func jsStringLiteral(_ s: String) -> String {
+        guard let data = try? JSONEncoder().encode(s) else { return "\"\"" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    // MARK: Link hover bubble
+
+    private func setLinkHover(_ url: URL?) {
+        if let url {
+            linkHoverLabel.stringValue = url.absoluteString
+            layoutOverlays()
+            linkHoverView.isHidden = false
+            linkHoverView.animator().alphaValue = 1
+        } else {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.12
+                self.linkHoverView.animator().alphaValue = 0
+            }, completionHandler: { [weak self] in
+                guard let self, self.linkHoverView.alphaValue == 0 else { return }
+                self.linkHoverView.isHidden = true
+            })
+        }
+    }
+
+    // MARK: Closed tabs and tab operations
+
+    private func recordClosedTab(_ tab: Tab) {
+        guard let u = tab.webView.url, u.scheme == "http" || u.scheme == "https" else { return }
+        closedTabs.append(u)
+        if closedTabs.count > 10 { closedTabs.removeFirst(closedTabs.count - 10) }
+    }
+
+    @objc func reopenClosedTabAction(_ sender: Any?) {
+        guard let url = closedTabs.popLast() else { return }
+        addTab(url: url)
+    }
+
+    private func duplicateTab(at index: Int) {
+        // A start-page tab has no URL to copy — its twin is just a fresh one.
+        addTab(url: tabs[index].webView.url)
+    }
+
+    private func moveTabToNewWindow(at index: Int) {
+        let url = tabs[index].webView.url
+        (NSApp.delegate as? AppDelegate)?.openWindow(
+            profile: profile, url: url, isPrivate: isPrivate)
+        // The tab moved rather than closed — it does not go on the reopen stack.
+        closeTab(at: index, recordClosed: false)
+    }
+
+    private func closeOtherTabs(than index: Int) {
+        let keep = tabs[index]
+        for (i, tab) in tabs.enumerated() where i != index {
+            recordClosedTab(tab)
+            tab.teardown()
+        }
+        tabs = [keep]
+        activeIndex = 0
+        refreshTabs()
+    }
+
+    private func closeTabsToRight(of index: Int) {
+        guard index + 1 < tabs.count else { return }
+        for tab in tabs[(index + 1)...] {
+            recordClosedTab(tab)
+            tab.teardown()
+        }
+        tabs.removeSubrange((index + 1)...)
+        if activeIndex > index { activeIndex = index }
+        refreshTabs()
+    }
+
+    private func buildTabContextMenu(for index: Int) -> NSMenu? {
+        guard tabs.indices.contains(index) else { return nil }
+        let menu = NSMenu()
+        func add(_ title: String, _ op: Int, enabled: Bool = true) {
+            let item = NSMenuItem(title: title, action: #selector(tabMenuAction(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.tag = op
+            item.representedObject = index
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+        add("Duplicate Tab", 0)
+        add("Move Tab to New Window", 1)
+        menu.addItem(.separator())
+        add("Close Tab", 2)
+        add("Close Other Tabs", 3, enabled: tabs.count > 1)
+        add("Close Tabs to the Right", 4, enabled: index < tabs.count - 1)
+        return menu
+    }
+
+    @objc private func tabMenuAction(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int, tabs.indices.contains(index) else { return }
+        switch sender.tag {
+        case 0: duplicateTab(at: index)
+        case 1: moveTabToNewWindow(at: index)
+        case 2: closeTab(at: index)
+        case 3: closeOtherTabs(than: index)
+        case 4: closeTabsToRight(of: index)
+        default: break
+        }
+    }
+
+    // MARK: Favicons
+
+    /// Refetches the tab's icon when the host changes. Icons are cached per
+    /// host for the life of the window, so walking around one site costs one
+    /// fetch, not one per page.
+    private func updateFavicon(for tab: Tab, url: URL?) {
+        let web = url?.scheme == "http" || url?.scheme == "https"
+        let host = web ? url?.host?.lowercased() : nil
+        guard tab.faviconHost != host else { return }
+        tab.faviconHost = host
+        let index = tabs.firstIndex { $0 === tab }
+        guard let host, let url else {
+            tab.favicon = nil
+            tabBar.update(iconAt: index, to: nil)
+            return
+        }
+        if let cached = faviconCache[host] {
+            tab.favicon = cached
+            tabBar.update(iconAt: index, to: cached)
+            return
+        }
+        tab.favicon = nil
+        tabBar.update(iconAt: index, to: nil)
+        QuickAccessIconFetcher.fetch(for: url) { [weak self, weak tab] dataURI, _ in
+            guard let self, let image = self.imageFromDataURI(dataURI) else { return }
+            self.faviconCache[host] = image
+            // The tab may have moved on while the fetch was out — the cache
+            // entry is still right, the icon on that tab would not be.
+            guard tab?.faviconHost == host else { return }
+            tab?.favicon = image
+            self.tabBar.update(iconAt: self.tabs.firstIndex { $0 === tab }, to: image)
+        }
+    }
+
+    // MARK: Site tweaks
+
+    /// Grants the current page whatever its host's `siteTweaks` entry allows.
+    /// Both switches are WebKit internals — guarded the same way the rest of
+    /// this file's private calls are: if the selector is not there, the site
+    /// just gets stock behavior.
+    private func applySiteTweaks(to tab: Tab) {
+        let host = tab.webView.url?.host?.lowercased() ?? ""
+        let tweaks = siteTweaks[host]
+        let stayLive = tweaks?.backgroundWork == true
+        let wv = tab.webView
+        // Occlusion off: a covered or minimized window no longer suspends
+        // rendering, so a remote session keeps painting unseen.
+        if wv.responds(to: Selector(("_setWindowOcclusionDetectionEnabled:"))) {
+            wv.setValue(!stayLive, forKey: "windowOcclusionDetectionEnabled")
+        }
+        // Timer throttling off: a non-front tab keeps its event loop at full
+        // speed instead of once-per-second.
+        let prefs = wv.configuration.preferences
+        if prefs.responds(to: Selector(("_setHiddenPageDOMTimerThrottlingEnabled:"))) {
+            prefs.setValue(!stayLive, forKey: "hiddenPageDOMTimerThrottlingEnabled")
+        }
+        refreshKeepAwake()
+    }
+
+    /// While a keep-awake site is the active tab of a visible window, hold an
+    /// activity that blocks App Nap, idle system sleep, and display sleep —
+    /// the three things that otherwise freeze a session left running. It is
+    /// released the moment the tab, the page, or the window no longer asks.
+    private func refreshKeepAwake() {
+        let host = activeTab.webView.url?.host?.lowercased() ?? ""
+        let wants = siteTweaks[host]?.keepAwake == true && window?.isVisible == true
+        if wants && keepAwakeActivity == nil {
+            keepAwakeActivity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .idleDisplaySleepDisabled],
+                reason: "Active remote session")
+        } else if !wants, let activity = keepAwakeActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            keepAwakeActivity = nil
+        }
+    }
+
+    /// Warms DNS + TCP + TLS inside WebKit's own networking process for the
+    /// sites opened most often, so the first navigation skips the handshake.
+    /// A URLSession warm-up would not do this — WebKit keeps its own
+    /// connection pool in a separate process.
+    private func preconnectFrequentHosts() {
+        let sel = Selector(("_preconnectToServer:"))
+        guard webView.responds(to: sel) else { return }
+        var origins = Set<String>()
+        for link in quickAccessStore.links {
+            guard let u = URL(string: link.url), u.scheme == "https", let host = u.host
+            else { continue }
+            origins.insert("https://\(host)")
+        }
+        for host in siteTweaks.keys { origins.insert("https://\(host)") }
+        for origin in origins {
+            if let u = URL(string: origin) { _ = webView.perform(sel, with: u) }
+        }
+    }
+
+    // MARK: Permission prompts
+
+    /// One sheet at a time, one answer per site per window. WebKit asks the
+    /// delegate for camera, microphone, location, and notification access; with
+    /// no delegate method the request is refused outright, which is why some
+    /// sites simply look broken.
+    private func askPermission(_ kind: String, host: String, note: String? = nil,
+                               answer: @escaping (Bool) -> Void) {
+        if launchOptions.snap != nil { answer(false); return }
+        let key = kind + "|" + host
+        if let remembered = permissionChoices[key] {
+            answer(remembered)
+            return
+        }
+        let task = { [weak self] in
+            guard let self, let window = self.window else { answer(false); return }
+            self.permissionPromptUp = true
+            let alert = NSAlert()
+            alert.messageText = "Allow “\(host)” to use your \(kind)?"
+            alert.informativeText = note
+                ?? "The choice is remembered for this window, not between launches."
+            alert.addButton(withTitle: "Allow")
+            alert.addButton(withTitle: "Don’t Allow")
+            // The floating HUD would sit under the sheet.
+            self.hideHUD()
+            alert.beginSheetModal(for: window) { response in
+                let allowed = response == .alertFirstButtonReturn
+                self.permissionChoices[key] = allowed
+                self.permissionPromptUp = false
+                answer(allowed)
+                self.pumpPermissionQueue()
+            }
+        }
+        if permissionPromptUp {
+            permissionQueue.append(task)
+        } else {
+            task()
+        }
+    }
+
+    private func pumpPermissionQueue() {
+        guard !permissionPromptUp, !permissionQueue.isEmpty else { return }
+        permissionQueue.removeFirst()()
+    }
+
+    private func permissionHost(_ webView: WKWebView, origin: WKSecurityOrigin) -> String {
+        origin.host.isEmpty ? (webView.url?.host ?? "this page") : origin.host
+    }
+
+    // Camera and microphone — public API since macOS 12.
+    func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo, type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        let kind = type == .camera ? "camera"
+            : type == .microphone ? "microphone"
+            : "camera and microphone"
+        askPermission(kind, host: permissionHost(webView, origin: origin)) {
+            decisionHandler($0 ? .grant : .deny)
+        }
+    }
+
+    // Geolocation — public since macOS 27. The two underscore spellings below
+    // are the same request on older systems, where it is still SPI; whichever
+    // one WebKit calls lands in the same prompt.
+    @available(macOS 27.0, *)
+    func webView(_ webView: WKWebView, requestGeolocationPermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        askPermission("location", host: permissionHost(webView, origin: origin)) {
+            decisionHandler($0 ? .grant : .deny)
+        }
+    }
+
+    func _webView(_ webView: WKWebView, requestGeolocationPermissionForOrigin origin: WKSecurityOrigin,
+                  initiatedByFrame frame: WKFrameInfo,
+                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        askPermission("location", host: permissionHost(webView, origin: origin)) {
+            decisionHandler($0 ? .grant : .deny)
+        }
+    }
+
+    func _webView(_ webView: WKWebView, requestGeolocationPermissionForFrame frame: WKFrameInfo,
+                  decisionHandler: @escaping (Bool) -> Void) {
+        askPermission("location", host: webView.url?.host ?? "this page", answer: decisionHandler)
+    }
+
+    // Notifications — still SPI. Allowing tells the site it may send; where the
+    // notifications would go is a question Chromeless does not answer yet, and
+    // the prompt says so instead of faking delivery.
+    func _webView(_ webView: WKWebView, requestNotificationPermissionForSecurityOrigin origin: WKSecurityOrigin,
+                  decisionHandler: @escaping (Bool) -> Void) {
+        askPermission("notifications", host: permissionHost(webView, origin: origin),
+                      note: "Chromeless can’t display notifications yet — Allow only tells the site it may send them.",
+                      answer: decisionHandler)
+    }
+
+    // beforeunload — the "leave site?" confirm a page raises on its way out.
+    // Unhandled, the navigation just vanishes with whatever was being typed.
+    func _webView(_ webView: WKWebView, runBeforeUnloadConfirmPanelWithMessage message: String,
+                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) {
+        if launchOptions.snap != nil { completionHandler(true); return }
+        let alert = NSAlert()
+        alert.messageText = "Leave this page?"
+        alert.informativeText = message.isEmpty
+            ? "Changes you made may not be saved."
+            : message
+        alert.addButton(withTitle: "Leave")
+        alert.addButton(withTitle: "Stay")
+        hideHUD()
+        if let window {
+            alert.beginSheetModal(for: window) {
+                completionHandler($0 == .alertFirstButtonReturn)
+            }
+        } else {
+            completionHandler(alert.runModal() == .alertFirstButtonReturn)
+        }
     }
 
     // MARK: Toast
@@ -2452,6 +3402,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(closeTabAction(_:)):
             menuItem.title = tabs.count > 1 ? "Close Tab" : "Close Window"
             return true
+        case #selector(reopenClosedTabAction(_:)):
+            return !closedTabs.isEmpty
+        case #selector(findNextAction(_:)), #selector(findPreviousAction(_:)):
+            return !findField.stringValue.isEmpty
         case #selector(copyPageURL(_:)):
             return webView.url != nil && webView.url?.absoluteString != "about:blank"
         case #selector(togglePin(_:)):
@@ -2483,7 +3437,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     func windowDidEnterFullScreen(_ notification: Notification) { setTrafficLights(visible: true) }
     func windowDidExitFullScreen(_ notification: Notification) { setTrafficLights(visible: false) }
 
+    // Minimizing or hiding the app flips isVisible — a keep-awake session only
+    // holds the display while the window can actually be seen.
+    func windowDidChangeOcclusionState(_ notification: Notification) { refreshKeepAwake() }
+
     func windowWillClose(_ notification: Notification) {
+        if let activity = keepAwakeActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            keepAwakeActivity = nil
+        }
         if let monitor = mouseMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
         mouseMonitor = nil
@@ -2511,6 +3473,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         let u = webView.url?.absoluteString
         if u != nil && u != "about:blank" { tab(for: webView)?.onStartPage = false }
+        if let t = tab(for: webView) { applySiteTweaks(to: t) }
+        // Whatever the pointer was over is gone with the old page.
+        if tab(for: webView) === activeTab { setLinkHover(nil) }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -2519,6 +3484,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         guard finished === activeTab else { return }
         // A new page means new context for the question being typed about it.
         if aiSidebarShown { captureAIPageContext() }
+        // The find term survives a navigation; the matches do not. Rescan on
+        // the new page, like every other find bar.
+        if !findBar.isHidden && !findField.stringValue.isEmpty {
+            performFind(target: 0)
+        }
         if let job = snapJob {
             snapJob = nil
             runSnapJob(job)
@@ -2630,6 +3600,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // The user agent is a property of the next load, not of this one —
+        // crossing into or out of a spoofed host means canceling the first
+        // attempt and starting it again under the right agent.
+        if navigationAction.targetFrame?.isMainFrame != false,
+           let url = navigationAction.request.url,
+           let host = url.host?.lowercased(),
+           ["http", "https"].contains(url.scheme ?? "") {
+            let wantUA = siteTweaks[host]?.chromeUserAgent == true ? chromeUserAgentString : nil
+            // The getter reports "" for "no override" on newer WebKit, not nil —
+            // comparing raw would restart every navigation forever.
+            let haveUA = webView.customUserAgent?.isEmpty == false ? webView.customUserAgent : nil
+            if haveUA != wantUA {
+                webView.customUserAgent = wantUA
+                decisionHandler(.cancel)
+                webView.load(navigationAction.request)
+                return
+            }
+        }
         // Hand non-web schemes (mailto:, facetime:, app links…) to the system — but
         // only when a click asked for it. Script-driven navigation to a scheme is
         // how a page launches another app behind the user's back, so that one gets
@@ -2731,9 +3719,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         // which is to say, sign-in popups finishing their handshake. Close the
         // tab and hand the window back to the opener, which by now is usually
         // already signed in. When the popup outlived its opener and is the last
-        // tab, closeTab performs the window close itself.
+        // tab, closeTab performs the window close itself. A popup finishing its
+        // job is not a tab the user closed — it stays off the reopen stack.
         guard let index = tabs.firstIndex(where: { $0.webView === webView }) else { return }
-        closeTab(at: index)
+        closeTab(at: index, recordClosed: false)
     }
 
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
@@ -2848,7 +3837,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let url: URL? = {
             if let u = launchOptions.url { return u }
             if launchOptions.snap != nil { return nil }
-            if launchOptions.restoreLastPage,
+            // A private window does not resurrect a page it never recorded.
+            if launchOptions.restoreLastPage, !launchOptions.privateWindow,
                let s = profile.lastURL { return URL(string: s) }
             return nil
         }()
@@ -2862,7 +3852,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             return
         }
 
-        openWindow(profile: profile, url: url, size: launchOptions.size, snap: launchOptions.snap, isPrimary: true)
+        openWindow(profile: profile, url: url, size: launchOptions.size,
+                   snap: launchOptions.snap, isPrimary: true,
+                   isPrivate: launchOptions.privateWindow)
         NSApp.activate(ignoringOtherApps: true)
 
         if launchOptions.snap != nil {
@@ -2874,9 +3866,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     func openWindow(profile: BrowserProfile, url: URL?, size: NSSize? = nil,
-                    snap: SnapJob? = nil, isPrimary: Bool = false) {
+                    snap: SnapJob? = nil, isPrimary: Bool = false, isPrivate: Bool = false) {
         let controller = BrowserWindowController(
-            profile: profile, url: url, size: size, snap: snap, isPrimary: isPrimary)
+            profile: profile, url: url, size: size, snap: snap,
+            isPrimary: isPrimary, isPrivate: isPrivate)
         controller.onClose = { [weak self, weak controller] in
             self?.controllers.removeAll { $0 === controller }
         }
@@ -2886,6 +3879,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     }
 
     @objc func newWindow(_ sender: Any?) { presentProfilePicker(from: nil) }
+
+    @objc func newPrivateWindow(_ sender: Any?) {
+        openWindow(profile: profileStore.defaultProfile, url: nil, isPrivate: true)
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
@@ -3096,8 +4093,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let fileMenu = NSMenu(title: "File")
         let newWin = fileMenu.addItem(withTitle: "New Window", action: #selector(newWindow(_:)), keyEquivalent: "n")
         newWin.target = self
+        let newPriv = fileMenu.addItem(withTitle: "New Private Window",
+                                       action: #selector(newPrivateWindow(_:)), keyEquivalent: "n")
+        newPriv.keyEquivalentModifierMask = [.command, .shift]
+        newPriv.target = self
         fileMenu.addItem(withTitle: "New Tab",
                          action: #selector(BrowserWindowController.newTabAction(_:)), keyEquivalent: "t")
+        let reopen = fileMenu.addItem(withTitle: "Reopen Closed Tab",
+                                      action: #selector(BrowserWindowController.reopenClosedTabAction(_:)),
+                                      keyEquivalent: "t")
+        reopen.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(withTitle: "Open Location…",
                          action: #selector(BrowserWindowController.openLocation(_:)), keyEquivalent: "l")
         fileMenu.addItem(.separator())
@@ -3122,6 +4127,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Find…",
+                         action: #selector(BrowserWindowController.findInPageAction(_:)), keyEquivalent: "f")
+        editMenu.addItem(withTitle: "Find Next",
+                         action: #selector(BrowserWindowController.findNextAction(_:)), keyEquivalent: "g")
+        let findPrev = editMenu.addItem(withTitle: "Find Previous",
+                                        action: #selector(BrowserWindowController.findPreviousAction(_:)),
+                                        keyEquivalent: "g")
+        findPrev.keyEquivalentModifierMask = [.command, .shift]
         editMenu.addItem(.separator())
         let copyURL = editMenu.addItem(withTitle: "Copy Current URL",
                                        action: #selector(BrowserWindowController.copyPageURL(_:)), keyEquivalent: "c")

@@ -24,7 +24,8 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 
 | Keys | Action |
 | --- | --- |
-| `⌘L` | Search or enter a URL (floating HUD) |
+| `⌘L` | Search or enter a URL — suggests history and quick-access links as you type |
+| `⌘F` / `⌘G` `⇧⌘G` | Find in page / next / previous match |
 | `⌘drag` | Move the window from anywhere |
 | `⌃⌘F` | Fullscreen (YouTube's own ⛶ button works too) |
 | `⇧⌘S` | Snapshot the page as PNG → Desktop |
@@ -36,16 +37,20 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
 | `⇧⌘A` | AI sidebar for this tab — ask about the page you are on |
 | `⇧⌘J` | Downloads panel |
-| `⌘T` | New tab |
+| `⌘T` / `⇧⌘T` | New tab / reopen a closed tab |
 | `⌘W` / `⇧⌘W` | Close tab / close the whole window |
 | `⌘1`…`⌘8` `⌘9` | Jump to the nth tab / the last tab |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab (`⇧⌘]` `⇧⌘[` too) |
-| `⌘N` | New profile window |
+| `⌘N` / `⇧⌘N` | New profile window / private window |
 | `⇧⌘B` | Block ads on this site — off turns the blocker off for that site only |
 | `⌃⇧⌘E` | Pick an element on the page to hide for good |
 | `F12` | Web Inspector (`⌥⌘I` too) |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
+
+Hovering a link shows its target in a small bubble at the bottom-left — the closest this browser gets to a status bar. `⌘F` opens a find bar that highlights matches as you type (`↩`/`⇧↩` or `⌘G`/`⇧⌘G` walk them). The `⌘L` HUD suggests addresses from the profile's history and your quick-access links; `↓`/`↑` walk the list, `↩` opens the pick. Tabs carry their site's favicon, and a right-click on one offers the usual operations: duplicate, move to a new window, or close the others.
+
+Sites that ask for camera, microphone, location, or notifications get a real prompt instead of a silent refusal — the answer is remembered for the window. A page's own "leave site?" confirm (`beforeunload`) is honoured too.
 File uploads use the native open panel: clicking an `<input type="file">` opens it as a sheet, honouring `multiple` and `webkitdirectory`. Dragging files onto the page works too.
 
 ## AI sidebar
@@ -171,11 +176,16 @@ A browser runs code written by strangers, so it is worth writing down what that
 code can touch here.
 
 * **The scripts this app injects live in their own content world.** The middle-click
-  handler and the element picker talk to the app over `WKScriptMessageHandler`, and
-  a page cannot see those handlers at all — different content world, different
-  global scope. Before that they sat in the page's world, where any site could post
-  to them: opening tabs unprompted, or writing an element-hiding rule for a domain
-  it does not own.
+  handler, the element picker, the find-in-page engine, and the link-hover reporter
+  talk to the app over `WKScriptMessageHandler`, and a page cannot see those
+  handlers at all — different content world, different global scope. Before that
+  they sat in the page's world, where any site could post to them: opening tabs
+  unprompted, or writing an element-hiding rule for a domain it does not own.
+* **Permission asks go through a real prompt.** Camera, microphone, location, and
+  notification requests get a sheet naming the site; the answer is kept for the
+  window only. Geolocation and notification support use WebKit's private delegate
+  selectors on systems where the public API does not reach — they are called only
+  when WebKit calls them.
 * **The start page's bridge is the exception, and carries a nonce.** It has to live
   in the page world, because the start page is a page. Every message it sends quotes
   a random value stamped into that document at load time, and the app drops anything
@@ -247,7 +257,7 @@ WebKit as a string with no base URL and so has no origin to load an image from.
 
 A window starts with one tab and no tab bar, so nothing changes until you press `⌘T`. From the second tab onward a thin bar appears at the top edge; close back down to one tab and it disappears again. Snapshots (`⇧⌘S`) capture the page only, so the bar never lands in a screenshot.
 
-Every tab in a window shares that window's profile and its cookies. To run two accounts side by side, open a second window with `⌘N` instead. Links with `target="_blank"` and `window.open` popups open as tabs rather than taking over the page. Tabs are not saved between launches.
+Every tab in a window shares that window's profile and its cookies. To run two accounts side by side, open a second window with `⌘N` instead. Links with `target="_blank"` and `window.open` popups open as tabs rather than taking over the page. `⇧⌘T` reopens the last tab you closed (the page reloads; its back-forward list does not come back). Right-click a tab for *Duplicate*, *Move Tab to New Window*, *Close Other Tabs*, and *Close Tabs to the Right*. Tabs are not saved between launches.
 
 ## Profiles
 
@@ -268,6 +278,20 @@ The selected default profile is used when launching without `--profile`, opening
 ```
 
 Deleting a profile asks for confirmation and removes its profile metadata plus WebKit website data. Close all windows using that profile before deleting it.
+
+**Private windows** (`⇧⌘N`, or `--private` on the command line) run on a non-persistent WebKit data store: cookies and site data live only for the window's life, nothing is written to the profile's history, and `--restore` does not apply to them. The badge in the corner reads *Private* instead of a profile name. Downloads still land in `~/Downloads` — they are files you asked for, not browsing data.
+
+## Per-site tweaks
+
+Some pages are closer to native apps than documents — remote desktops, live terminals, dashboards left on a second screen. The `siteTweaks` table in `main.swift` grants them, by host, three things a normal page never gets:
+
+| Tweak | What it does |
+| --- | --- |
+| `keepAwake` | While the site is the active tab of a visible window, App Nap, idle system sleep, and display sleep are all held off — a session you are watching never freezes because the screen went dark. |
+| `chromeUserAgent` | Presents a Chrome user agent to the site. Some apps serve a faster path to Chrome; a few serve a Chrome-*only* one. If a site misbehaves, flip it off. |
+| `backgroundWork` | Keeps the page fully alive out of sight: WebKit's window-occlusion suspension is off (video keeps painting under a covered or minimized window) and DOM timers are not throttled in a non-front tab. This costs idle CPU/GPU — which is why it is opt-in per site. |
+
+Currently: `remotedesktop.google.com` gets all three; `orca-win.haiho.net` gets `keepAwake` and `backgroundWork`. On launch the app also preconnects to these hosts and to every quick-access host, so the first navigation skips the DNS+TCP+TLS handshake.
 
 ## Ad blocking
 
@@ -316,6 +340,7 @@ usage: chromeless [url] [options]
   --restore         reopen the selected profile's last saved page
   --profile <name>  use a specific profile
   --profiles        list profiles and exit
+  --private         open a private window (nothing is saved)
   --adblock-selftest    check the filter converter and exit
   --adblock-compiletest convert every installed list and compile it for real
 ```
