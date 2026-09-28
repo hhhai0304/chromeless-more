@@ -285,6 +285,22 @@ final class ProfileStore {
         save()
     }
 
+    // Drops every recorded visit under the domain, along with a lastURL
+    // pointing at it — otherwise the next launch would resurrect a page whose
+    // site data was just wiped.
+    func removeHistory(forDomain domain: String, in profile: BrowserProfile) {
+        guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
+        profiles[index].history.removeAll {
+            URL(string: $0)?.host.flatMap { registrableDomain(for: $0) } == domain
+        }
+        if let host = profiles[index].lastURL.flatMap({ URL(string: $0)?.host }),
+           registrableDomain(for: host) == domain {
+            profiles[index].lastURL = nil
+        }
+        profiles[index].updatedAt = Date()
+        save()
+    }
+
     private func load() {
         do {
             try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
@@ -3372,6 +3388,62 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         AdBlockSettingsWindowController.shared.present()
     }
 
+    // Wipes one domain out of this window's data store — cookies, cache, local
+    // storage, everything WebKit keeps — plus the history the profile recorded
+    // for it. The field opens prefilled with the current page's domain, since
+    // "clear this site" is the common case; typing any domain works too.
+    @objc func clearSiteData(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Clear Site Data"
+        alert.informativeText = isPrivate
+            ? "Deletes cookies, cache, and site storage for one domain. Private windows record no history."
+            : "Deletes cookies, cache, site storage, and history for one domain in the “\(profile.name)” profile."
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "example.com"
+        field.stringValue = AdBlockManager.domain(for: webView.url) ?? ""
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let domain = siteDomain(from: field.stringValue) else {
+            let typed = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !typed.isEmpty { showToast("“\(typed)” is not a domain") }
+            return
+        }
+        let profile = self.profile
+        let isPrivate = self.isPrivate
+        let dataStore = webView.configuration.websiteDataStore
+        let types = WKWebsiteDataStore.allWebsiteDataTypes()
+        dataStore.fetchDataRecords(ofTypes: types) { [weak self] records in
+            // A record's displayName is a host; reducing both sides to the
+            // registrable domain covers every subdomain at once.
+            let matches = records.filter { registrableDomain(for: $0.displayName) == domain }
+            dataStore.removeData(ofTypes: types, for: matches) { [weak self] in
+                DispatchQueue.main.async { [weak self] in
+                    if !isPrivate {
+                        profileStore.removeHistory(forDomain: domain, in: profile)
+                    }
+                    guard let self else { return }
+                    self.faviconCache = self.faviconCache.filter {
+                        registrableDomain(for: $0.key) != domain
+                    }
+                    self.permissionChoices = self.permissionChoices.filter {
+                        $0.key.split(separator: "|").last
+                            .flatMap { registrableDomain(for: String($0)) } != domain
+                    }
+                    // Reloading a page on the wiped domain is the visible half
+                    // of the feedback — a logged-out page says more than a toast.
+                    if AdBlockManager.domain(for: self.webView.url) == domain {
+                        self.reloadPage(nil)
+                    }
+                    self.showToast(matches.isEmpty
+                        ? "No stored data for \(domain)"
+                        : "Cleared data for \(domain)")
+                }
+            }
+        }
+    }
+
     @objc func newTabAction(_ sender: Any?) { addTab(url: nil) }
 
     @objc func closeTabAction(_ sender: Any?) { closeTab(at: activeIndex) }
@@ -4186,6 +4258,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         picker.keyEquivalentModifierMask = [.command, .shift, .control]
         viewMenu.addItem(withTitle: "Ad Blocking…",
                          action: #selector(BrowserWindowController.showAdBlockSettings(_:)), keyEquivalent: "")
+        viewMenu.addItem(.separator())
+        // ⌫ is Chrome's Clear Browsing Data shortcut, so the muscle memory
+        // already knows where this lives.
+        let clearSite = viewMenu.addItem(
+            withTitle: "Clear Site Data…",
+            action: #selector(BrowserWindowController.clearSiteData(_:)),
+            keyEquivalent: "\u{8}")
+        clearSite.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         let inspector = viewMenu.addItem(
             withTitle: "Show Web Inspector",

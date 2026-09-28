@@ -166,16 +166,7 @@ final class AdBlockManager {
     // or nil when the input cannot name a site at all.
     @discardableResult
     func addToAllowlist(_ input: String) -> String? {
-        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        // A little filter-syntax tolerance: "||example.com^" means the domain.
-        if text.hasPrefix("||") { text.removeFirst(2) }
-        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "^"))
-        let candidate = text.contains("://") ? text : "https://\(text)"
-        let host = URL(string: candidate)?.host ?? text
-        guard let domain = registrableDomain(for: host), !domain.isEmpty,
-              domain.rangeOfCharacter(
-                  from: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789.-").inverted
-              ) == nil else { return nil }
+        guard let domain = siteDomain(from: input) else { return nil }
         if !settings.allowlist.contains(domain) {
             settings.allowlist.append(domain)
             saveSettings()
