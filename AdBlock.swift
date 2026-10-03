@@ -195,15 +195,22 @@ final class AdBlockManager {
         rebuild { _ in completion?() }
     }
 
-    func appendCustomRule(_ line: String, completion: (() -> Void)? = nil) {
+    /// Appends `line`, dropping stored rules listed in `absorbed` — rules the
+    /// page proved redundant because every element they match sits inside the
+    /// element the new rule hides. An empty `line` still applies the drops.
+    /// A no-op result skips the rebuild.
+    func appendCustomRule(_ line: String, absorbing absorbed: Set<String> = [],
+                          completion: (() -> Void)? = nil) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { completion?(); return }
         var lines = settings.customRules.split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
-        lines.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard !lines.contains(trimmed) else { completion?(); return }
-        lines.append(trimmed)
-        setCustomRules(lines.joined(separator: "\n"), completion: completion)
+        lines.removeAll {
+            $0.trimmingCharacters(in: .whitespaces).isEmpty || absorbed.contains($0)
+        }
+        if !trimmed.isEmpty && !lines.contains(trimmed) { lines.append(trimmed) }
+        let updated = lines.joined(separator: "\n")
+        guard updated != settings.customRules else { completion?(); return }
+        setCustomRules(updated, completion: completion)
     }
 
     // MARK: Subscriptions

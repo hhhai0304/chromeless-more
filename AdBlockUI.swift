@@ -70,7 +70,7 @@ let adBlockPickerScript = #"""
   var spacer = document.createElement('span');
   spacer.style.flex = '1';
   var cancelBtn = panelButton('Cancel', 'Back to picking');
-  var hideBtn = panelButton('Hide', 'Hide this element and reload the page');
+  var hideBtn = panelButton('Hide', 'Hide this element for good');
   hideBtn.style.background = '#408cff';
   var btnRow = document.createElement('div');
   btnRow.style.cssText = 'display:flex;align-items:center;gap:8px;';
@@ -240,10 +240,8 @@ let adBlockPickerScript = #"""
     clearPreview();
     // Hide the element now: rebuilding the rule list takes a moment, and the
     // element staying gone is the feedback that the click landed. The saved
-    // rule covers the next load, so the page is never reloaded — when the
-    // rule's fate is decided the app calls back: settled(false) only drops
-    // the progress note, settled(true) puts the element back because nothing
-    // was saved.
+    // rule covers the next load, so the page is never reloaded — if nothing
+    // ends up saved the app calls back and the element is restored.
     var hidden = target;
     var origDisplay = hidden.style.getPropertyValue('display');
     var origPriority = hidden.style.getPropertyPriority('display');
@@ -256,20 +254,17 @@ let adBlockPickerScript = #"""
           hidden.style.removeProperty('display');
         }
       }
-      if (hint.parentNode) hint.parentNode.removeChild(hint);
       window.__chromelessPickDone = null;
     };
-    // The picker's own chrome comes down except the hint, which stays up as a
-    // progress note until the callback above removes it.
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKey, true);
     removeSwallows();
     if (shield.parentNode) shield.parentNode.removeChild(shield);
     if (box.parentNode) box.parentNode.removeChild(box);
+    if (hint.parentNode) hint.parentNode.removeChild(hint);
     if (panel.parentNode) panel.parentNode.removeChild(panel);
     window.__chromelessPicker = null;
-    hint.textContent = 'Saving the rule…';
     window.webkit.messageHandlers.chromelessPicker.postMessage(
       JSON.stringify({ selector: selector, host: location.hostname }));
   }
@@ -409,8 +404,58 @@ final class AdBlockPickerRouter: NSObject, WKScriptMessageHandler {
             webView.onPickedSelector?(nil)
             return
         }
-        adBlockManager.appendCustomRule("\(domain)##\(selector)") {
-            webView.onPickedSelector?(selector)
+        let ruleLine = "\(domain)##\(selector)"
+        let prefix = "\(domain)##"
+        let siblings = adBlockManager.settings.customRules
+            .split(separator: "\n").map(String.init)
+            .compactMap { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil }
+        guard let argsData = try? JSONSerialization.data(
+                withJSONObject: ["n": selector, "o": siblings]),
+              let args = String(data: argsData, encoding: .utf8)
+        else {
+            adBlockManager.appendCustomRule(ruleLine) { webView.onPickedSelector?(selector) }
+            return
+        }
+        // Ask the live page which of the domain's stored rules the new pick
+        // swallows — a rule whose every match sits inside the new target is
+        // dead weight — and whether a stored rule already covers the pick
+        // (then adding it would only duplicate what stays hidden anyway).
+        // Failing the probe falls back to a plain append, which is safe.
+        let probe = """
+        (function (a) {
+          var out = { drop: [], covered: false }, news, i;
+          try { news = document.querySelectorAll(a.n); } catch (e) { return JSON.stringify(out); }
+          if (!news.length) return JSON.stringify(out);
+          news = Array.prototype.slice.call(news);
+          var rest = [];
+          for (i = 0; i < a.o.length; i++) {
+            var els;
+            try { els = Array.prototype.slice.call(document.querySelectorAll(a.o[i])); }
+            catch (e) { continue; }
+            if (!els.length) continue;
+            var inside = els.every(function (el) {
+              return news.some(function (n) { return n === el || n.contains(el); });
+            });
+            if (inside) { out.drop.push(a.o[i]); continue; }
+            rest = rest.concat(els);
+          }
+          out.covered = news.every(function (n) {
+            return rest.some(function (el) { return el === n || el.contains(n); });
+          });
+          return JSON.stringify(out);
+        })(\(args))
+        """
+        webView.evaluateJavaScript(probe, in: nil, in: chromelessWorld) { res in
+            var absorbed = Set<String>()
+            var covered = false
+            if let json = (try? res.get()) as? String, let data = json.data(using: .utf8),
+               let out = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                absorbed = Set((out["drop"] as? [String] ?? []).map { "\(prefix)\($0)" })
+                covered = out["covered"] as? Bool ?? false
+            }
+            adBlockManager.appendCustomRule(covered ? "" : ruleLine, absorbing: absorbed) {
+                webView.onPickedSelector?(selector)
+            }
         }
     }
 }

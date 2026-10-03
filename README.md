@@ -315,8 +315,10 @@ the sites blocking is off for — added there by domain or toggled with ⇧⌘B.
   shows the page with it already hidden, and **Hide**
   hides it on the spot — no reload, the saved rule covers the next visit.
   **Cancel** goes back to picking, `↑`/`↓` still nudge the size, `esc` quits.
-  The rule is saved as `domain##selector` in your own rules. Picked elements
-  are hidden, not blocked — the bytes still arrive.
+  The rule is saved as `domain##selector` in your own rules; older rules the
+  new pick covers entirely are dropped, and a pick already covered by an
+  existing rule adds nothing. Picked elements are hidden, not blocked — the
+  bytes still arrive.
 - Rules use AdBlock Plus syntax, so any list in that format can be added.
 
 Settings live in `~/Library/Application Support/Chromeless/AdBlock/`, shared by
