@@ -36,6 +36,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
 | `⇧⌘A` | AI sidebar for this tab — ask about the page you are on |
+| `⇧` with text selected | Translate the selection — Vietnamese by default, English if it already is |
 | `⇧⌘J` | Downloads panel |
 | `⌘T` / `⇧⌘T` | New tab / reopen a closed tab |
 | `⌘W` / `⇧⌘W` | Close tab / close the whole window |

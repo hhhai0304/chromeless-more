@@ -737,6 +737,9 @@ final class BrowserWebView: WKWebView {
     // Fed by `LinkHoverRouter` as the pointer moves over anchors: the link's
     // href, or nil when the pointer is no longer on one.
     var onLinkHover: ((URL?) -> Void)?
+    // Fed by `TranslateRouter` when ⇧ is pressed with an active selection, and
+    // again when the page wants the bubble gone (scroll, click, collapse).
+    var onTranslate: (([String: Any]) -> Void)?
 
     // ⌘ is overloaded: ⌘-drag moves the window, ⌘-click opens the link under
     // the cursor in a new tab. Which one it is is not knowable at mouse-down,
@@ -1048,6 +1051,8 @@ func makeWebConfiguration(for profile: BrowserProfile, isPrivate: Bool = false) 
                                    name: AdBlockPickerRouter.messageName)
     conf.userContentController.add(LinkHoverRouter.shared, contentWorld: chromelessWorld,
                                    name: LinkHoverRouter.messageName)
+    conf.userContentController.add(TranslateRouter.shared, contentWorld: chromelessWorld,
+                                   name: TranslateRouter.messageName)
     // The start page is a page, so its bridge has to be in the page world. What
     // keeps another site out is the nonce it carries — see `handleQuickAccess`.
     conf.userContentController.add(QuickAccessRouter.shared, name: QuickAccessRouter.messageName)
@@ -1057,6 +1062,12 @@ func makeWebConfiguration(for profile: BrowserProfile, isPrivate: Bool = false) 
     conf.userContentController.addUserScript(WKUserScript(
         source: linkHoverScript, injectionTime: .atDocumentStart, forMainFrameOnly: false,
         in: chromelessWorld))
+    // Main frame only: the popover anchors to a rect the script reports, and
+    // an iframe's coordinates can't be re-expressed in the window's space when
+    // it is cross-origin — a wrong anchor is worse than no trigger.
+    conf.userContentController.addUserScript(WKUserScript(
+        source: translateTriggerScript, injectionTime: .atDocumentStart,
+        forMainFrameOnly: true, in: chromelessWorld))
     if !hasPasskeyEntitlement {
         let hideWebAuthn = WKUserScript(
             source: """
@@ -1507,6 +1518,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var findDebounce: DispatchWorkItem?
     private let linkHoverView = NSVisualEffectView()
     private let linkHoverLabel = NSTextField(labelWithString: "")
+    private let translatePopover = TranslatePopover()
+    private let translator = Translator()
     private var closedTabs: [URL] = []
     private var faviconCache: [String: NSImage] = [:]
     private var keepAwakeActivity: NSObjectProtocol?
@@ -1595,6 +1608,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         container.addSubview(tabs[0].webView)
 
         buildOverlays(in: container)
+        // The Translation framework can only prompt for language packs from a
+        // SwiftUI-provided session; this parks the invisible view that mints
+        // them for the window's lifetime.
+        translator.attach(to: container)
 
         window.center()
         if isPrimary && snap == nil {
@@ -1633,6 +1650,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         wv.onLinkHover = { [weak self, weak wv] url in
             guard let self, let wv, self.tab(for: wv) === self.activeTab else { return }
             self.setLinkHover(url)
+        }
+        wv.onTranslate = { [weak self, weak wv] body in
+            guard let self, let wv, self.tab(for: wv) === self.activeTab else { return }
+            self.handleTranslateMessage(body, from: wv)
         }
         wv.onPickedSelector = { [weak self, weak wv] selector in
             guard let self else { return }
@@ -1738,6 +1759,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         tabBar.isHidden = !tabBarVisible
         // The bubble belongs to the page it hovered over, not the window.
         setLinkHover(nil)
+        dismissTranslate()
         refreshKeepAwake()
         // The tab bar sits in the titlebar strip, which the WindowServer claims
         // as a window-drag region from outside this process. No view-level
@@ -2107,6 +2129,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func toggleAIButton(_ sender: Any?) {
         AIButtonPreference.set(!AIButtonPreference.isOn)
+    }
+
+    @objc func toggleTranslateOnShift(_ sender: Any?) {
+        TranslatePreference.set(!TranslatePreference.isOn)
+        if !TranslatePreference.isOn { dismissTranslate() }
     }
 
     @objc func toggleProfileChip(_ sender: Any?) {
@@ -2917,6 +2944,45 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
+    // MARK: Selection translate
+
+    private func handleTranslateMessage(_ body: [String: Any], from wv: BrowserWebView) {
+        if body["dismiss"] as? Bool == true {
+            dismissTranslate()
+            return
+        }
+        guard TranslatePreference.isOn,
+              let raw = body["text"] as? String,
+              !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        func num(_ key: String) -> CGFloat {
+            CGFloat((body[key] as? NSNumber)?.doubleValue ?? 0)
+        }
+        // The rect arrives in CSS pixels; the same zoom the link-hit test
+        // divides out is multiplied back in here. The web view is flipped, so
+        // CSS's top-down Y is already the view's Y.
+        let scale = wv.pageZoom * wv.magnification
+        guard scale > 0 else { return }
+        var rect = NSRect(x: num("x") * scale, y: num("y") * scale,
+                          width: max(num("w") * scale, 2), height: max(num("h") * scale, 2))
+        rect = rect.intersection(wv.bounds)
+        guard !rect.isNull, !rect.isEmpty else { return }
+        translatePopover.show(relativeTo: rect, of: wv)
+        translator.translate(
+            raw,
+            onUpdate: { [weak self] text, note in
+                self?.translatePopover.update(text, note: note)
+            },
+            onFinish: { [weak self] error in
+                guard let error else { return }
+                self?.translatePopover.fail(error.localizedDescription)
+            })
+    }
+
+    private func dismissTranslate() {
+        translator.cancel()
+        translatePopover.close()
+    }
+
     // MARK: Closed tabs and tab operations
 
     private func recordClosedTab(_ tab: Tab) {
@@ -3585,6 +3651,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         case #selector(toggleAIButton(_:)):
             menuItem.state = AIButtonPreference.isOn ? .on : .off
             return true
+        case #selector(toggleTranslateOnShift(_:)):
+            menuItem.state = TranslatePreference.isOn ? .on : .off
+            return true
         case #selector(toggleProfileChip(_:)):
             menuItem.state = ProfileChipPreference.isOn ? .on : .off
             return true
@@ -3617,6 +3686,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if let monitor = keyMonitor { NSEvent.removeMonitor(monitor) }
         mouseMonitor = nil
         keyMonitor = nil
+        dismissTranslate()
         downloadsHide?.cancel()
         downloadsHide = nil
         for observer in downloadsObservers { NotificationCenter.default.removeObserver(observer) }
@@ -3644,6 +3714,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         applySavedZoom(to: webView)
         // Whatever the pointer was over is gone with the old page.
         if tab(for: webView) === activeTab { setLinkHover(nil) }
+        // The selection — and the rect it was measured in — is gone too.
+        if tab(for: webView) === activeTab { dismissTranslate() }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -4382,6 +4454,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                          action: #selector(BrowserWindowController.toggleAIButton(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "AI Settings…",
                          action: #selector(BrowserWindowController.showAISettings(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Translate Selection on ⇧",
+                         action: #selector(BrowserWindowController.toggleTranslateOnShift(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let siteBlocking = viewMenu.addItem(
             withTitle: "Block Ads on This Site",

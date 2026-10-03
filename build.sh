@@ -19,9 +19,10 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 \
   -target "$ARCH-apple-macos13.0" \
   main.swift Downloads.swift AdBlock.swift AdBlockFilters.swift AdBlockUI.swift QuickAccess.swift \
-  AI.swift AIUI.swift SiteTweaks.swift SettingsUI.swift \
+  AI.swift AIUI.swift SiteTweaks.swift SettingsUI.swift Translate.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
-  -framework Cocoa -framework WebKit
+  -framework Cocoa -framework WebKit -framework SwiftUI -framework NaturalLanguage \
+  -Xlinker -weak_framework -Xlinker Translation
 
 cp Chromeless.icns "$APP/Contents/Resources/Chromeless.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
