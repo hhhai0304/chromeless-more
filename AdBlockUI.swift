@@ -11,12 +11,22 @@ import WebKit
 
 // Injected on demand into the active tab. It draws its own highlight, and a
 // click docks a small panel that grows or shrinks the selection through the
-// ancestor chain before Hide hands the chosen selector back over a message
+// stacking order before Hide hands the chosen selector back over a message
 // handler. Only the main frame is reachable, so an ad inside an iframe cannot be
 // picked — the frame itself can.
 let adBlockPickerScript = #"""
 (function () {
   if (window.__chromelessPicker) { window.__chromelessPicker.stop(); return; }
+
+  // A transparent shield swallows every pointer event before the page — or an
+  // ad iframe inside it — can act on the click; sites that navigate on
+  // mousedown or a click-capture registered before ours cannot steal the
+  // pick. Hit-testing then has to skip it, so the picker walks the full
+  // elementsFromPoint stack: [0] is what the pointer sees, deeper entries are
+  // whatever is covered — the elements an overlay hides, then the ancestors.
+  var shield = document.createElement('div');
+  shield.style.cssText = 'position:fixed;z-index:2147483646;left:0;top:0;' +
+    'right:0;bottom:0;cursor:crosshair;';
 
   var box = document.createElement('div');
   box.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;' +
@@ -73,13 +83,18 @@ let adBlockPickerScript = #"""
   panel.appendChild(selLabel);
   panel.appendChild(btnRow);
 
+  document.documentElement.appendChild(shield);
   document.documentElement.appendChild(box);
   document.documentElement.appendChild(hint);
   document.documentElement.appendChild(panel);
 
   var target = null;
-  var lifted = 0;   // how many levels up from the element under the pointer
-  var hovered = null;
+  // The last hit-test: every element under the pointer, ours filtered out.
+  // `depth` is the size dial — 0 is what is actually under the cursor, each +
+  // steps outward to whatever is stacked beneath it (its container, the
+  // overlay covering it, the ancestors).
+  var stack = [];
+  var depth = 0;
   var confirming = false;
   // Preview hides the current target with inline display:none, the same thing
   // the compiled rule will do — and keeps enough to put the element's own
@@ -148,18 +163,25 @@ let adBlockPickerScript = #"""
     return parts.join(' > ');
   }
 
-  function resolve() {
-    var node = hovered;
-    for (var i = 0; i < lifted && node && node.parentElement; i++) {
-      if (node.parentElement.tagName === 'BODY') break;
-      node = node.parentElement;
-    }
-    return node;
+  function ours(e) {
+    return e === shield || e === box || e === hint || panel.contains(e);
   }
 
+  // Everything the pointer is over, topmost first, minus the picker's own
+  // chrome — the shield is pointer-events:auto so it always tops the raw list.
+  function restack(x, y) {
+    var all = document.elementsFromPoint(x, y);
+    var s = [];
+    for (var i = 0; i < all.length; i++) if (!ours(all[i])) s.push(all[i]);
+    return s;
+  }
+
+  function resolve() { return stack[depth] || null; }
+
+  // Growing stops under BODY — hiding the whole page is never the intent.
   function canGrow() {
-    return !!(target && target.parentElement &&
-      target.parentElement.tagName !== 'BODY');
+    var next = stack[depth + 1];
+    return !!next && next.tagName !== 'BODY' && next.tagName !== 'HTML';
   }
 
   function paint() {
@@ -171,7 +193,7 @@ let adBlockPickerScript = #"""
     var sel = selectorFor(target);
     selLabel.textContent = sel;
     selLabel.title = sel;
-    shrinkBtn.style.opacity = lifted > 0 ? '1' : '.35';
+    shrinkBtn.style.opacity = depth > 0 ? '1' : '.35';
     growBtn.style.opacity = canGrow() ? '1' : '.35';
     if (previewEl) {
       box.style.display = 'none';
@@ -197,31 +219,37 @@ let adBlockPickerScript = #"""
     // page's own inline display, not ours.
     clearPreview();
     // Hide the element now: rebuilding the rule list takes a moment, and the
-    // element staying gone is the feedback that the click landed. The page
-    // reloads once the rule is live; if the selector cannot be saved the app
-    // calls back through __chromelessUnhide to put it back.
+    // element staying gone is the feedback that the click landed. The saved
+    // rule covers the next load, so the page is never reloaded — when the
+    // rule's fate is decided the app calls back: settled(false) only drops
+    // the progress note, settled(true) puts the element back because nothing
+    // was saved.
     var hidden = target;
     var origDisplay = hidden.style.getPropertyValue('display');
     var origPriority = hidden.style.getPropertyPriority('display');
     hidden.style.setProperty('display', 'none', 'important');
-    window.__chromelessUnhide = function () {
-      if (origDisplay) {
-        hidden.style.setProperty('display', origDisplay, origPriority);
-      } else {
-        hidden.style.removeProperty('display');
+    window.__chromelessPickDone = function (restore) {
+      if (restore) {
+        if (origDisplay) {
+          hidden.style.setProperty('display', origDisplay, origPriority);
+        } else {
+          hidden.style.removeProperty('display');
+        }
       }
       if (hint.parentNode) hint.parentNode.removeChild(hint);
-      window.__chromelessUnhide = null;
+      window.__chromelessPickDone = null;
     };
     // The picker's own chrome comes down except the hint, which stays up as a
-    // progress note until the reload (or an unhide) removes it.
+    // progress note until the callback above removes it.
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKey, true);
+    removeSwallows();
+    if (shield.parentNode) shield.parentNode.removeChild(shield);
     if (box.parentNode) box.parentNode.removeChild(box);
     if (panel.parentNode) panel.parentNode.removeChild(panel);
     window.__chromelessPicker = null;
-    hint.textContent = 'Saving the rule — the page reloads when it is live';
+    hint.textContent = 'Saving the rule…';
     window.webkit.messageHandlers.chromelessPicker.postMessage(
       JSON.stringify({ selector: selector, host: location.hostname }));
   }
@@ -231,9 +259,9 @@ let adBlockPickerScript = #"""
     // other elements on its way to the buttons, and it must not drag the
     // highlight along with it.
     if (confirming) return;
-    var node = document.elementFromPoint(e.clientX, e.clientY);
-    if (!node || node === box || node === hint || panel.contains(node)) return;
-    if (node !== hovered) { hovered = node; lifted = 0; }
+    var s = restack(e.clientX, e.clientY);
+    if (s[0] !== stack[0]) depth = 0;
+    stack = s;
     paint();
   }
 
@@ -242,12 +270,9 @@ let adBlockPickerScript = #"""
     e.preventDefault();
     e.stopPropagation();
     // A click on the page while the panel is up re-picks what is under it.
-    var node = document.elementFromPoint(e.clientX, e.clientY);
-    if (node && node !== box && node !== hint && !panel.contains(node)
-        && node !== hovered) {
-      hovered = node;
-      lifted = 0;
-    }
+    var s = restack(e.clientX, e.clientY);
+    if (s[0] !== stack[0]) depth = 0;
+    stack = s;
     target = resolve();
     if (!target) { stop(); return; }
     confirming = true;
@@ -259,13 +284,13 @@ let adBlockPickerScript = #"""
     if (e.key === 'Escape') { e.preventDefault(); stop(); return; }
     if (e.key === 'ArrowUp') {
       e.preventDefault();
-      if (canGrow()) lifted++;
+      if (canGrow()) depth++;
       paint();
       return;
     }
     if (e.key === 'ArrowDown') {
       e.preventDefault();
-      if (lifted > 0) lifted--;
+      if (depth > 0) depth--;
       paint();
       return;
     }
@@ -273,11 +298,11 @@ let adBlockPickerScript = #"""
   }
 
   shrinkBtn.addEventListener('click', function () {
-    if (lifted > 0) lifted--;
+    if (depth > 0) depth--;
     paint();
   });
   growBtn.addEventListener('click', function () {
-    if (canGrow()) lifted++;
+    if (canGrow()) depth++;
     paint();
   });
   previewBtn.addEventListener('click', function () {
@@ -295,11 +320,33 @@ let adBlockPickerScript = #"""
     paint();
   });
 
+  function swallow(e) { e.preventDefault(); e.stopPropagation(); }
+
+  // Captured on window so they run ahead of any document-level ad handler —
+  // ad networks like to navigate on mousedown or pointerdown, and a listener
+  // registered here before theirs still beats every target/bubble path. The
+  // shield already retargets the events; this keeps the browser's own
+  // defaults (text selection, context menus) quiet too.
+  var swallowTypes = ['mousedown', 'mouseup', 'pointerdown', 'pointerup',
+    'auxclick', 'contextmenu'];
+  function addSwallows() {
+    for (var i = 0; i < swallowTypes.length; i++) {
+      window.addEventListener(swallowTypes[i], swallow, true);
+    }
+  }
+  function removeSwallows() {
+    for (var i = 0; i < swallowTypes.length; i++) {
+      window.removeEventListener(swallowTypes[i], swallow, true);
+    }
+  }
+
   function stop() {
     clearPreview();
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKey, true);
+    removeSwallows();
+    if (shield.parentNode) shield.parentNode.removeChild(shield);
     if (box.parentNode) box.parentNode.removeChild(box);
     if (hint.parentNode) hint.parentNode.removeChild(hint);
     if (panel.parentNode) panel.parentNode.removeChild(panel);
@@ -309,6 +356,7 @@ let adBlockPickerScript = #"""
   document.addEventListener('mousemove', onMove, true);
   document.addEventListener('click', onClick, true);
   document.addEventListener('keydown', onKey, true);
+  addSwallows();
   window.__chromelessPicker = { stop: stop };
   hint.textContent = 'Move over the element you want to hide — click to select, esc to cancel';
 })();

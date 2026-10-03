@@ -1665,15 +1665,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                 // The picker hid the element when Hide was clicked; with no
                 // rule saved, put it back.
                 wv?.evaluateJavaScript(
-                    "window.__chromelessUnhide && window.__chromelessUnhide();",
+                    "window.__chromelessPickDone && window.__chromelessPickDone(true);",
                     in: nil, in: chromelessWorld, completionHandler: nil)
                 return
             }
-            // The rule is compiled by the time this runs, but the page in front
-            // of the user was laid out before it existed. The picker has
-            // already hidden the element, so the reload only makes it official.
-            self.showToast("Hiding \(selector)")
-            self.reloadPage(nil)
+            // No reload: the picker hid the element when Hide was clicked and
+            // the compiled rule covers the next load. Reloading would only
+            // cost the page's scroll position and whatever was typed into it.
+            self.showToast("\(selector) stays hidden")
+            wv?.evaluateJavaScript(
+                "window.__chromelessPickDone && window.__chromelessPickDone(false);",
+                in: nil, in: chromelessWorld, completionHandler: nil)
         }
         adBlockManager.register(wv)
         wv.navigationDelegate = self
