@@ -3084,6 +3084,47 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         }
     }
 
+    // MARK: Site zoom
+
+    /// `pageZoom` is a property of the web view, not the page — left alone, a
+    /// zoom picked on one site follows the tab to every site after it. This
+    /// map makes zoom per site the way other browsers do: keyed by host (port
+    /// included, so `localhost:3000` and `:8080` are different sites), kept in
+    /// UserDefaults so every window shares it, applied on each committed
+    /// navigation, and an absent key meaning 100%.
+    private let siteZoomDefaultsKey = "ChromelessSiteZooms"
+
+    private func siteZoomKey(for url: URL?) -> String? {
+        guard let url else { return nil }
+        // Local documents have no host; they share one zoom like one origin.
+        if url.isFileURL { return "file" }
+        guard let host = url.host?.lowercased(), !host.isEmpty else { return nil }
+        if let port = url.port { return "\(host):\(port)" }
+        return host
+    }
+
+    private func applySavedZoom(to wv: WKWebView) {
+        var zoom = CGFloat(1)
+        if let key = siteZoomKey(for: wv.url),
+           let saved = UserDefaults.standard.dictionary(forKey: siteZoomDefaultsKey)?[key] as? Double {
+            zoom = CGFloat(saved)
+        }
+        if wv.pageZoom != zoom { wv.pageZoom = zoom }
+    }
+
+    private func saveZoom(for wv: WKWebView) {
+        // A private window reads the shared map but never adds to it — an
+        // entry is a record that the site was visited.
+        guard !isPrivate, let key = siteZoomKey(for: wv.url) else { return }
+        var zooms = UserDefaults.standard.dictionary(forKey: siteZoomDefaultsKey) as? [String: Double] ?? [:]
+        if abs(wv.pageZoom - 1.0) < 0.001 {
+            zooms.removeValue(forKey: key)
+        } else {
+            zooms[key] = Double(wv.pageZoom)
+        }
+        UserDefaults.standard.set(zooms, forKey: siteZoomDefaultsKey)
+    }
+
     /// Warms DNS + TCP + TLS inside WebKit's own networking process for the
     /// sites opened most often, so the first navigation skips the handshake.
     /// A URLSession warm-up would not do this — WebKit keeps its own
@@ -3315,9 +3356,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     @objc func goBackAction(_ sender: Any?) { webView.goBack() }
     @objc func goForwardAction(_ sender: Any?) { webView.goForward() }
 
-    @objc func zoomInPage(_ sender: Any?) { webView.pageZoom = min(webView.pageZoom * 1.1, 5.0) }
-    @objc func zoomOutPage(_ sender: Any?) { webView.pageZoom = max(webView.pageZoom / 1.1, 0.25) }
-    @objc func resetZoom(_ sender: Any?) { webView.pageZoom = 1.0 }
+    @objc func zoomInPage(_ sender: Any?) {
+        webView.pageZoom = min(webView.pageZoom * 1.1, 5.0)
+        saveZoom(for: webView)
+    }
+
+    @objc func zoomOutPage(_ sender: Any?) {
+        webView.pageZoom = max(webView.pageZoom / 1.1, 0.25)
+        saveZoom(for: webView)
+    }
+
+    @objc func resetZoom(_ sender: Any?) {
+        webView.pageZoom = 1.0
+        saveZoom(for: webView)
+    }
 
     @objc func saveSnapshot(_ sender: Any?) {
         let formatter = DateFormatter()
@@ -3546,6 +3598,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         let u = webView.url?.absoluteString
         if u != nil && u != "about:blank" { tab(for: webView)?.onStartPage = false }
         if let t = tab(for: webView) { applySiteTweaks(to: t) }
+        applySavedZoom(to: webView)
         // Whatever the pointer was over is gone with the old page.
         if tab(for: webView) === activeTab { setLinkHover(nil) }
     }

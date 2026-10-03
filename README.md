@@ -32,7 +32,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⌘P` | Pin the window above everything |
 | `⌘[` / `⌘]` | Back / forward (two-finger swipe also works) |
 | `⇧⌘H` | Home — back to the start page |
-| `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) |
+| `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) — level is remembered per site |
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
 | `⇧⌘A` | AI sidebar for this tab — ask about the page you are on |
