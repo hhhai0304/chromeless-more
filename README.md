@@ -312,10 +312,10 @@ the sites blocking is off for — added there by domain or toggled with ⇧⌘B.
 - `⌃⇧⌘E` starts the element picker: hover to highlight, click to select, then
   the panel's `−`/`+` shrink or grow the selection through the element's
   ancestors, **Preview** shows the page with it already hidden, and **Hide**
-  confirms — the page reloads right away. **Cancel** goes back to picking,
-  `↑`/`↓` still nudge the size, `esc` quits. The rule is saved as
-  `domain##selector` in your own rules. Picked elements are hidden, not
-  blocked — the bytes still arrive.
+  hides it on the spot, reloading once the rule is compiled in. **Cancel**
+  goes back to picking, `↑`/`↓` still nudge the size, `esc` quits. The rule is
+  saved as `domain##selector` in your own rules. Picked elements are hidden,
+  not blocked — the bytes still arrive.
 - Rules use AdBlock Plus syntax, so any list in that format can be added.
 
 Settings live in `~/Library/Application Support/Chromeless/AdBlock/`, shared by

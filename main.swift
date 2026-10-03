@@ -1658,14 +1658,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             guard let self, let wv, self.tab(for: wv) === self.activeTab else { return }
             self.setLinkHover(url)
         }
-        wv.onPickedSelector = { [weak self] selector in
+        wv.onPickedSelector = { [weak self, weak wv] selector in
             guard let self else { return }
             guard let selector else {
                 self.showToast("That element can’t be targeted safely")
+                // The picker hid the element when Hide was clicked; with no
+                // rule saved, put it back.
+                wv?.evaluateJavaScript(
+                    "window.__chromelessUnhide && window.__chromelessUnhide();",
+                    in: nil, in: chromelessWorld, completionHandler: nil)
                 return
             }
             // The rule is compiled by the time this runs, but the page in front
-            // of the user was laid out before it existed.
+            // of the user was laid out before it existed. The picker has
+            // already hidden the element, so the reload only makes it official.
             self.showToast("Hiding \(selector)")
             self.reloadPage(nil)
         }

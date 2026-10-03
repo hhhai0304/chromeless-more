@@ -192,11 +192,38 @@ let adBlockPickerScript = #"""
   function commit() {
     if (!target) { stop(); return; }
     var selector = selectorFor(target);
-    stop();
-    if (selector) {
-      window.webkit.messageHandlers.chromelessPicker.postMessage(
-        JSON.stringify({ selector: selector, host: location.hostname }));
-    }
+    if (!selector) { stop(); return; }
+    // Clearing a live preview first means the values captured below are the
+    // page's own inline display, not ours.
+    clearPreview();
+    // Hide the element now: rebuilding the rule list takes a moment, and the
+    // element staying gone is the feedback that the click landed. The page
+    // reloads once the rule is live; if the selector cannot be saved the app
+    // calls back through __chromelessUnhide to put it back.
+    var hidden = target;
+    var origDisplay = hidden.style.getPropertyValue('display');
+    var origPriority = hidden.style.getPropertyPriority('display');
+    hidden.style.setProperty('display', 'none', 'important');
+    window.__chromelessUnhide = function () {
+      if (origDisplay) {
+        hidden.style.setProperty('display', origDisplay, origPriority);
+      } else {
+        hidden.style.removeProperty('display');
+      }
+      if (hint.parentNode) hint.parentNode.removeChild(hint);
+      window.__chromelessUnhide = null;
+    };
+    // The picker's own chrome comes down except the hint, which stays up as a
+    // progress note until the reload (or an unhide) removes it.
+    document.removeEventListener('mousemove', onMove, true);
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('keydown', onKey, true);
+    if (box.parentNode) box.parentNode.removeChild(box);
+    if (panel.parentNode) panel.parentNode.removeChild(panel);
+    window.__chromelessPicker = null;
+    hint.textContent = 'Saving the rule — the page reloads when it is live';
+    window.webkit.messageHandlers.chromelessPicker.postMessage(
+      JSON.stringify({ selector: selector, host: location.hostname }));
   }
 
   function onMove(e) {
@@ -295,8 +322,12 @@ final class AdBlockPickerRouter: NSObject, WKScriptMessageHandler {
 
     func userContentController(_ controller: WKUserContentController,
                                didReceive message: WKScriptMessage) {
-        guard let webView = message.webView as? BrowserWebView,
-              let body = message.body as? String,
+        // The picker hides the element before this message arrives, so every
+        // rejection has to reach `onPickedSelector(nil)` — that is what puts
+        // the element back. Only a malformed message with no usable web view
+        // can be dropped silently, and it is not the picker's anyway.
+        guard let webView = message.webView as? BrowserWebView else { return }
+        guard let body = message.body as? String,
               let data = body.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String],
               let selector = payload["selector"], !selector.isEmpty,
@@ -304,9 +335,9 @@ final class AdBlockPickerRouter: NSObject, WKScriptMessageHandler {
               // message: a rule for someone else's site is not the picker's to ask
               // for, and it is the whole prize if this handler is ever reachable.
               let host = webView.url?.host ?? payload["host"],
-              let domain = registrableDomain(for: host)
-        else { return }
-        guard FilterCompiler.isSafeSelector(selector) else {
+              let domain = registrableDomain(for: host),
+              FilterCompiler.isSafeSelector(selector)
+        else {
             webView.onPickedSelector?(nil)
             return
         }
