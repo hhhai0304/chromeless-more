@@ -21,8 +21,7 @@ swiftc -O -swift-version 5 \
   main.swift Downloads.swift AdBlock.swift AdBlockFilters.swift AdBlockUI.swift QuickAccess.swift \
   AI.swift AIUI.swift SiteTweaks.swift SettingsUI.swift Translate.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
-  -framework Cocoa -framework WebKit -framework SwiftUI -framework NaturalLanguage \
-  -Xlinker -weak_framework -Xlinker Translation
+  -framework Cocoa -framework WebKit -framework NaturalLanguage
 
 cp Chromeless.icns "$APP/Contents/Resources/Chromeless.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'

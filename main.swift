@@ -1519,6 +1519,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private let linkHoverView = NSVisualEffectView()
     private let linkHoverLabel = NSTextField(labelWithString: "")
     private let translatePopover = TranslatePopover()
+    private let systemTranslate = SystemTranslationOverlay()
     private let translator = Translator()
     private var closedTabs: [URL] = []
     private var faviconCache: [String: NSImage] = [:]
@@ -1608,10 +1609,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         container.addSubview(tabs[0].webView)
 
         buildOverlays(in: container)
-        // The Translation framework can only prompt for language packs from a
-        // SwiftUI-provided session; this parks the invisible view that mints
-        // them for the window's lifetime.
-        translator.attach(to: container)
 
         window.center()
         if isPrimary && snap == nil {
@@ -2966,6 +2963,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
                           width: max(num("w") * scale, 2), height: max(num("h") * scale, 2))
         rect = rect.intersection(wv.bounds)
         guard !rect.isNull, !rect.isEmpty else { return }
+        // The system overlay WebKit's context-menu Translate uses is the
+        // primary path; the AI stream only runs when that service is missing.
+        if systemTranslate.show(text: raw, relativeTo: rect, of: wv) { return }
         translatePopover.show(relativeTo: rect, of: wv)
         translator.translate(
             raw,
@@ -2980,6 +2980,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     private func dismissTranslate() {
         translator.cancel()
+        systemTranslate.close()
         translatePopover.close()
     }
 

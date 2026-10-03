@@ -1,8 +1,6 @@
 import Cocoa
 import NaturalLanguage
-import SwiftUI
 import WebKit
-import Translation
 
 // MARK: - Preference
 
@@ -97,204 +95,121 @@ final class TranslateRouter: NSObject, WKScriptMessageHandler {
     }
 }
 
-// MARK: - Errors
+// MARK: - System translation overlay
 
-enum TranslateError: LocalizedError {
-    /// The pair isn't supported by on-device translation — the caller falls
-    /// back to the configured AI provider.
-    case unsupportedPair
-    case unavailable(String)
+/// Presents the same translation overlay WebKit shows for its context-menu
+/// Translate item. That UI is `LTUITranslationViewController` from the private
+/// `TranslationUIServices` framework — WebKit instantiates it directly into an
+/// NSPopover, and so do we. Everything is looked up dynamically, so a system
+/// where the framework or the service is missing simply reports unavailable
+/// and the caller falls back to the AI pipeline.
+///
+/// Unlike WebKit — which only sets `text` and lets the overlay guess — the
+/// target locale is pinned to Vietnamese so the pair is right every time, and
+/// Vietnamese input flips the pair to translate into English.
+final class SystemTranslationOverlay {
+    private var popover: NSPopover?
 
-    var errorDescription: String? {
-        switch self {
-        case .unsupportedPair:
-            return "On-device translation doesn't cover this language pair."
-        case .unavailable(let message): return message
-        }
-    }
-}
+    /// Resolved once; a missing framework or class means the feature never
+    /// existed on this system and there is nothing to retry.
+    private static let viewControllerClass: NSViewController.Type? = {
+        guard let bundle = Bundle(path: "/System/Library/PrivateFrameworks/TranslationUIServices.framework"),
+              bundle.load(),
+              let cls = NSClassFromString("LTUITranslationViewController") as? NSViewController.Type
+        else { return nil }
+        return cls
+    }()
 
-// MARK: - Apple Translation bridge
-
-// `TranslationSession(installedSource:)` only ever uses packs already on the
-// device — it cannot ask to download one. Sessions that can ask are handed out
-// exclusively by SwiftUI's `.translationTask`, so an invisible hosting view is
-// parked in the window to mint them. The session is then kept and reused for
-// that language pair; the bridge only fires once per pair.
-@available(macOS 15.0, *)
-private final class TranslationBridgeModel: ObservableObject {
-    @Published var configuration: TranslationSession.Configuration?
-    var onSession: ((TranslationSession) -> Void)?
-}
-
-@available(macOS 15.0, *)
-private struct TranslationBridgeView: View {
-    @ObservedObject var model: TranslationBridgeModel
-    var body: some View {
-        Color.clear
-            .frame(width: 1, height: 1)
-            .translationTask(model.configuration) { session in
-                model.onSession?(session)
-            }
-    }
-}
-
-/// A continuation that resumes at most once: the session callback and the
-/// timeout race, and only the first wins.
-private final class ResumeOnce<T> {
-    private enum State {
-        case idle, waiting(CheckedContinuation<T, Never>), done(T)
-    }
-    private var state = State.idle
-
-    var value: T {
-        get async {
-            switch state {
-            case .done(let v): return v
-            case .idle:
-                return await withCheckedContinuation { c in state = .waiting(c) }
-            case .waiting: fatalError("awaited twice")
-            }
-        }
+    /// Checked on every call — like WebKit's canHandleContextMenuTranslation —
+    /// because the service can be toggled in System Settings at runtime.
+    static var isAvailable: Bool {
+        guard let cls = viewControllerClass else { return false }
+        return (cls as AnyObject).value(forKey: "available") as? Bool ?? false
     }
 
-    func resume(_ v: T) {
-        switch state {
-        case .idle: state = .done(v)
-        case .waiting(let c): state = .done(v); c.resume(returning: v)
-        case .done: break
-        }
-    }
-}
-
-@available(macOS 15.0, *)
-@MainActor
-final class AppleTranslator {
-    private let model = TranslationBridgeModel()
-    private var hosting: NSHostingView<TranslationBridgeView>?
-    /// Sessions that worked, keyed `source>target` ("auto" when the source was
-    /// left for the framework to detect). A bridged session keeps its download
-    /// powers, so it is worth keeping around.
-    private var sessions: [String: TranslationSession] = [:]
-    private var waiters: [String: ResumeOnce<TranslationSession?>] = [:]
-    /// Which pair the next delivered session belongs to — the task closure
-    /// hands over a bare session, so the pairing has to be tracked alongside.
-    private var pendingKey: String?
-    private let availability = LanguageAvailability()
-
-    func attach(to container: NSView) {
-        guard hosting == nil else { return }
-        model.onSession = { [weak self] session in
-            Task { @MainActor in self?.adopt(session) }
-        }
-        // 1x1 of transparent SwiftUI: enough to count as appeared, which is
-        // all `.translationTask` asks before it will run.
-        let view = NSHostingView(rootView: TranslationBridgeView(model: model))
-        view.frame = NSRect(x: 0, y: 0, width: 1, height: 1)
-        container.addSubview(view)
-        hosting = view
-    }
-
-    private func adopt(_ session: TranslationSession) {
-        guard let key = pendingKey else { return }
-        pendingKey = nil
-        sessions[key] = session
-        waiters.removeValue(forKey: key)?.resume(session)
-    }
-
-    /// Translates into Vietnamese, or into English when the text already is —
-    /// that direction is the one people reach for when they Shift a sentence
-    /// they can already read.
-    func translate(_ text: String) async throws -> String {
+    /// Anchors the overlay to the selection rect. Returns false when the
+    /// service is unavailable and nothing was presented.
+    @discardableResult
+    func show(text: String, relativeTo rect: NSRect, of view: NSView) -> Bool {
+        guard let cls = Self.viewControllerClass, Self.isAvailable else { return false }
+        let controller = cls.init()
+        controller.setValue(NSAttributedString(string: text), forKey: "text")
         let (source, target) = Self.languagePair(for: text)
-        let key = "\(source?.minimalIdentifier ?? "auto")>\(target.minimalIdentifier)"
-        if let cached = sessions[key] {
-            do { return try await cached.translate(text).targetText }
-            catch { sessions.removeValue(forKey: key) }
+        controller.setValue(NSLocale(localeIdentifier: source), forKey: "sourceLocale")
+        controller.setValue(NSLocale(localeIdentifier: target), forKey: "targetLocale")
+        if let metaClass = NSClassFromString("LTUISourceMeta") as? NSObject.Type {
+            let meta = metaClass.init()
+            meta.setValue(0, forKey: "origin") // LTUISourceMetaOriginUnspecified
+            controller.setValue(meta, forKey: "sourceMeta")
         }
-        if let source,
-           await availability.status(from: source, to: target) == .unsupported {
-            throw TranslateError.unsupportedPair
+        if controller.preferredContentSize == .zero {
+            controller.preferredContentSize = NSSize(width: 400, height: 400)
         }
-        let session = try await bridgedSession(key: key, source: source, target: target)
-        return try await session.translate(text).targetText
+        let pop = NSPopover()
+        pop.behavior = .transient
+        pop.appearance = view.effectiveAppearance
+        pop.animates = true
+        pop.contentViewController = controller
+        pop.contentSize = controller.preferredContentSize
+        popover?.close()
+        popover = pop
+        // A keyboard trigger has no click point, so the overlay sits at the
+        // selection's trailing edge — WebKit's aim == center branch — rather
+        // than below it like the AI fallback bubble.
+        let edge: NSRectEdge = view.userInterfaceLayoutDirection == .rightToLeft ? .minX : .maxX
+        pop.show(relativeTo: rect, of: view, preferredEdge: edge)
+        return true
     }
 
-    /// Gets a download-capable session out of the hidden SwiftUI view. The
-    /// system shows its own approval/progress UI if a pack has to come down
-    /// first; the waiter's timeout doubles as the cancellation hatch, since a
-    /// dismissed prompt delivers no session at all.
-    private func bridgedSession(key: String, source: Locale.Language?,
-                                target: Locale.Language) async throws -> TranslationSession {
-        guard hosting != nil else {
-            throw TranslateError.unavailable("The translation session can't start.")
-        }
-        let waiter = ResumeOnce<TranslationSession?>()
-        waiters[key] = waiter
-        pendingKey = key
-        model.configuration = TranslationSession.Configuration(source: source, target: target)
-        // An identical configuration would not re-fire the task; invalidating
-        // the stored copy marks it changed and makes the fire unconditional.
-        DispatchQueue.main.async { [weak self] in
-            self?.model.configuration?.invalidate()
-        }
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 30_000_000_000)
-            waiter.resume(nil)
-        }
-        guard let session = await waiter.value else {
-            waiters.removeValue(forKey: key)
-            if pendingKey == key { pendingKey = nil }
-            throw TranslateError.unavailable("The translation session never started.")
-        }
-        return session
+    func close() {
+        popover?.close()
+        popover = nil
     }
 
-    /// What the selection most likely is, and what it should become. The
-    /// recognizer only needs the head of the text — dominance is stable long
-    /// before 500 characters.
-    static func languagePair(for text: String) -> (source: Locale.Language?, target: Locale.Language) {
-        let vi = Locale.Language(identifier: "vi")
+    /// What the selection most likely is, and what it should become:
+    /// Vietnamese input means the reader wants English, anything else wants
+    /// Vietnamese. The source must always be pinned — unset, the overlay
+    /// stops at a "Choose Language" prompt on every presentation.
+    ///
+    /// The recognizer is trusted only when it is sure: real sentences score
+    /// above 0.9, while isolated words and proper nouns produce noise like
+    /// Dutch-for-"Terminator" that would pin an absurd pair. Below the
+    /// threshold the fallback is English — the foreign language a Vietnamese
+    /// reader overwhelmingly Shift-selects — and the overlay's own picker is
+    /// still there for the rare miss. The recognizer only needs the head of
+    /// the text — dominance is stable long before 500 characters.
+    static func languagePair(for text: String) -> (source: String, target: String) {
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(String(text.prefix(500)))
-        guard let dominant = recognizer.dominantLanguage else { return (nil, vi) }
-        if dominant == .vietnamese {
-            return (vi, Locale.Language(identifier: "en"))
-        }
-        return (Locale.Language(identifier: dominant.rawValue), vi)
+        guard let dominant = recognizer.dominantLanguage else { return ("en_US", "vi_VN") }
+        if dominant == .vietnamese { return ("vi_VN", "en_US") }
+        let confidence = recognizer.languageHypotheses(withMaximum: 1)[dominant] ?? 0
+        return (confidence >= 0.6 ? localeIdentifier(for: dominant.rawValue) : "en_US", "vi_VN")
+    }
+
+    /// Turns a language tag into the region-qualified form the translation
+    /// service's assets are keyed on — "en" → "en_US", "zh-Hans" → "zh_CN".
+    /// Bare language tags are rejected outright: the engine reports the pair
+    /// as unsupported instead of normalizing them.
+    private static func localeIdentifier(for languageTag: String) -> String {
+        let parts = Locale.Language(identifier: languageTag).maximalIdentifier.split(separator: "-")
+        guard parts.count > 1, let region = parts.last,
+              (region.count == 2 && region.allSatisfy(\.isLetter)) ||
+              (region.count == 3 && region.allSatisfy(\.isNumber))
+        else { return languageTag }
+        return "\(parts[0])_\(region.uppercased())"
     }
 }
 
 // MARK: - Translator
 
-/// One translation pipeline per window: Apple Translation first (on-device,
-/// free), the configured AI provider when the pair isn't supported or the
-/// session can't start. `onUpdate` carries the running text plus a footer
-/// naming the engine that produced it.
+/// The AI pipeline behind the system overlay, used only when the overlay
+/// service is missing or disabled. `onUpdate` carries the running text plus a
+/// footer naming the model that produced it.
 final class Translator {
-    private var work: Task<Void, Never>?
     private var stream: AIStream?
-    /// Stored untyped because a stored property can't carry the availability
-    /// annotation `AppleTranslator` needs — `apple()` does the narrow cast.
-    private var appleBox: AnyObject?
-
-    @available(macOS 15.0, *)
-    @MainActor
-    private func apple() -> AppleTranslator {
-        if let existing = appleBox as? AppleTranslator { return existing }
-        let created = AppleTranslator()
-        appleBox = created
-        return created
-    }
-
-    func attach(to container: NSView) {
-        guard #available(macOS 15.0, *) else { return }
-        Task { @MainActor in self.apple().attach(to: container) }
-    }
 
     func cancel() {
-        work?.cancel()
-        work = nil
         stream?.cancel()
         stream = nil
     }
@@ -303,34 +218,11 @@ final class Translator {
                    onUpdate: @escaping (_ text: String, _ note: String) -> Void,
                    onFinish: @escaping (Error?) -> Void) {
         cancel()
-        work = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var appleError: Error?
-            if #available(macOS 15.0, *) {
-                do {
-                    let result = try await self.apple().translate(text)
-                    guard !Task.isCancelled else { return }
-                    onUpdate(result, "On-device")
-                    onFinish(nil)
-                    return
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    appleError = error
-                }
-            }
-            self.translateViaAI(text, appleError: appleError,
-                                onUpdate: onUpdate, onFinish: onFinish)
-        }
-    }
-
-    private func translateViaAI(_ text: String, appleError: Error?,
-                                onUpdate: @escaping (String, String) -> Void,
-                                onFinish: @escaping (Error?) -> Void) {
         let settings = aiSettingsStore.settings
         guard let ref = settings.resolve(nil), let provider = settings.provider(ref.providerID) else {
-            onFinish(appleError ?? AIError(message: settings.isBlank
-                ? "Set up a provider in View ▸ AI Settings — on-device translation can't handle this language."
-                : "Check the connection in View ▸ AI Settings — on-device translation can't handle this language."))
+            onFinish(AIError(message: settings.isBlank
+                ? "System translation isn't available on this Mac — set up a provider in View ▸ AI Settings."
+                : "System translation isn't available — check the connection in View ▸ AI Settings."))
             return
         }
         let note = "AI · \(AISettings.shortModel(ref.model))"
