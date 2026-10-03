@@ -9,8 +9,9 @@ import WebKit
 
 // MARK: - Element picker
 
-// Injected on demand into the active tab. It draws its own highlight, walks the
-// DOM with the arrow keys, and hands the chosen selector back over a message
+// Injected on demand into the active tab. It draws its own highlight, and a
+// click docks a small panel that grows or shrinks the selection through the
+// ancestor chain before Hide hands the chosen selector back over a message
 // handler. Only the main frame is reachable, so an ad inside an iframe cannot be
 // picked — the frame itself can.
 let adBlockPickerScript = #"""
@@ -27,12 +28,49 @@ let adBlockPickerScript = #"""
     'background:rgba(20,20,26,.94);color:#f2f2f7;border-radius:9px;padding:9px 14px;' +
     'font:12px/1.45 -apple-system,system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.45);' +
     'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+
+  // The confirm panel docks at the bottom, clear of whatever the highlight is
+  // covering, and keeps pointer events so its buttons can be clicked — the
+  // document-level handlers below bail out for anything inside it.
+  var panel = document.createElement('div');
+  panel.style.cssText = 'position:fixed;z-index:2147483647;left:50%;bottom:20px;' +
+    'transform:translateX(-50%);display:none;align-items:center;gap:8px;' +
+    'max-width:86vw;background:rgba(20,20,26,.96);color:#f2f2f7;' +
+    'border-radius:10px;padding:10px 12px;' +
+    'font:12px/1.45 -apple-system,system-ui,sans-serif;' +
+    'box-shadow:0 8px 28px rgba(0,0,0,.5);white-space:nowrap;';
+
+  function panelButton(text, title) {
+    var b = document.createElement('button');
+    b.textContent = text;
+    b.title = title;
+    b.style.cssText = 'border:0;border-radius:6px;padding:5px 11px;cursor:pointer;' +
+      'font:12px -apple-system,system-ui,sans-serif;' +
+      'background:rgba(255,255,255,.15);color:#f2f2f7;';
+    return b;
+  }
+  var shrinkBtn = panelButton('−', 'Shrink the selection');
+  var growBtn = panelButton('+', 'Grow the selection');
+  var selLabel = document.createElement('span');
+  selLabel.style.cssText = 'max-width:38vw;overflow:hidden;' +
+    'text-overflow:ellipsis;opacity:.85;';
+  var hideBtn = panelButton('Hide', 'Hide this element and reload the page');
+  hideBtn.style.background = '#408cff';
+  var cancelBtn = panelButton('Cancel', 'Back to picking');
+  panel.appendChild(shrinkBtn);
+  panel.appendChild(growBtn);
+  panel.appendChild(selLabel);
+  panel.appendChild(hideBtn);
+  panel.appendChild(cancelBtn);
+
   document.documentElement.appendChild(box);
   document.documentElement.appendChild(hint);
+  document.documentElement.appendChild(panel);
 
   var target = null;
   var lifted = 0;   // how many levels up from the element under the pointer
   var hovered = null;
+  var confirming = false;
 
   function stableClass(c) {
     if (!c || c.length > 40) return false;
@@ -86,6 +124,11 @@ let adBlockPickerScript = #"""
     return node;
   }
 
+  function canGrow() {
+    return !!(target && target.parentElement &&
+      target.parentElement.tagName !== 'BODY');
+  }
+
   function paint() {
     target = resolve();
     if (!target) { box.style.display = 'none'; return; }
@@ -95,19 +138,17 @@ let adBlockPickerScript = #"""
     box.style.top = r.top + 'px';
     box.style.width = Math.max(0, r.width - 2) + 'px';
     box.style.height = Math.max(0, r.height - 2) + 'px';
-    hint.textContent = selectorFor(target) + '   —   click to hide, ↑ ↓ resize, esc to cancel';
+    var sel = selectorFor(target);
+    selLabel.textContent = sel;
+    selLabel.title = sel;
+    shrinkBtn.style.opacity = lifted > 0 ? '1' : '.35';
+    growBtn.style.opacity = canGrow() ? '1' : '.35';
+    hint.textContent = confirming
+      ? 'Adjust the size, then Hide — esc quits'
+      : sel + '   —   click to select, esc to cancel';
   }
 
-  function onMove(e) {
-    var node = document.elementFromPoint(e.clientX, e.clientY);
-    if (!node || node === box || node === hint) return;
-    if (node !== hovered) { hovered = node; lifted = 0; }
-    paint();
-  }
-
-  function onClick(e) {
-    e.preventDefault();
-    e.stopPropagation();
+  function commit() {
     if (!target) { stop(); return; }
     var selector = selectorFor(target);
     stop();
@@ -117,11 +158,66 @@ let adBlockPickerScript = #"""
     }
   }
 
+  function onMove(e) {
+    // While the panel is up the selection is frozen: the pointer has to cross
+    // other elements on its way to the buttons, and it must not drag the
+    // highlight along with it.
+    if (confirming) return;
+    var node = document.elementFromPoint(e.clientX, e.clientY);
+    if (!node || node === box || node === hint || panel.contains(node)) return;
+    if (node !== hovered) { hovered = node; lifted = 0; }
+    paint();
+  }
+
+  function onClick(e) {
+    if (panel.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    // A click on the page while the panel is up re-picks what is under it.
+    var node = document.elementFromPoint(e.clientX, e.clientY);
+    if (node && node !== box && node !== hint && !panel.contains(node)
+        && node !== hovered) {
+      hovered = node;
+      lifted = 0;
+    }
+    target = resolve();
+    if (!target) { stop(); return; }
+    confirming = true;
+    panel.style.display = 'flex';
+    paint();
+  }
+
   function onKey(e) {
     if (e.key === 'Escape') { e.preventDefault(); stop(); return; }
-    if (e.key === 'ArrowUp') { e.preventDefault(); lifted++; paint(); return; }
-    if (e.key === 'ArrowDown') { e.preventDefault(); if (lifted > 0) lifted--; paint(); }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (canGrow()) lifted++;
+      paint();
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (lifted > 0) lifted--;
+      paint();
+      return;
+    }
+    if (confirming && e.key === 'Enter') { e.preventDefault(); commit(); }
   }
+
+  shrinkBtn.addEventListener('click', function () {
+    if (lifted > 0) lifted--;
+    paint();
+  });
+  growBtn.addEventListener('click', function () {
+    if (canGrow()) lifted++;
+    paint();
+  });
+  hideBtn.addEventListener('click', commit);
+  cancelBtn.addEventListener('click', function () {
+    confirming = false;
+    panel.style.display = 'none';
+    paint();
+  });
 
   function stop() {
     document.removeEventListener('mousemove', onMove, true);
@@ -129,6 +225,7 @@ let adBlockPickerScript = #"""
     document.removeEventListener('keydown', onKey, true);
     if (box.parentNode) box.parentNode.removeChild(box);
     if (hint.parentNode) hint.parentNode.removeChild(hint);
+    if (panel.parentNode) panel.parentNode.removeChild(panel);
     window.__chromelessPicker = null;
   }
 
@@ -136,7 +233,7 @@ let adBlockPickerScript = #"""
   document.addEventListener('click', onClick, true);
   document.addEventListener('keydown', onKey, true);
   window.__chromelessPicker = { stop: stop };
-  hint.textContent = 'Move over the element you want to hide — click to confirm, esc to cancel';
+  hint.textContent = 'Move over the element you want to hide — click to select, esc to cancel';
 })();
 """#
 

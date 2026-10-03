@@ -309,8 +309,10 @@ the sites blocking is off for — added there by domain or toggled with ⇧⌘B.
 
 - `⇧⌘B` toggles blocking for the site you are on. Some sites do break without
   their ad frames; this is the escape hatch.
-- `⌃⇧⌘E` starts the element picker: hover to highlight, `↑`/`↓` to grow or
-  shrink the selection, click to hide it for good, `esc` to cancel. The rule is
+- `⌃⇧⌘E` starts the element picker: hover to highlight, click to select, then
+  the panel's `−`/`+` shrink or grow the selection through the element's
+  ancestors and **Hide** confirms — the page reloads right away. **Cancel**
+  goes back to picking, `↑`/`↓` still nudge the size, `esc` quits. The rule is
   saved as `domain##selector` in your own rules. Picked elements are hidden, not
   blocked — the bytes still arrive.
 - Rules use AdBlock Plus syntax, so any list in that format can be added.
