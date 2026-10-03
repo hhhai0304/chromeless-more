@@ -45,6 +45,7 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 | `⇧⌘B` | Block ads on this site — off turns the blocker off for that site only |
 | `⌃⇧⌘E` | Pick an element on the page to hide for good |
 | `⇧⌘⌫` | Clear site data — cookies, cache, storage, and history for one domain |
+| `⌘,` | Settings — site tweaks, site zooms, corner buttons |
 | `F12` | Web Inspector (`⌥⌘I` too) |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
@@ -284,15 +285,18 @@ Deleting a profile asks for confirmation and removes its profile metadata plus W
 
 ## Per-site tweaks
 
-Some pages are closer to native apps than documents — remote desktops, live terminals, dashboards left on a second screen. The `siteTweaks` table in `main.swift` grants them, by host, three things a normal page never gets:
+Some pages are closer to native apps than documents — remote desktops, live terminals, dashboards left on a second screen. **⌘, → Settings** grants them, by host, four things a normal page never gets — the same table lives in `~/Library/Application Support/Chromeless/site-tweaks.json` if you prefer a file:
 
 | Tweak | What it does |
 | --- | --- |
 | `keepAwake` | While the site is the active tab of a visible window, App Nap, idle system sleep, and display sleep are all held off — a session you are watching never freezes because the screen went dark. |
 | `chromeUserAgent` | Presents a Chrome user agent to the site. Some apps serve a faster path to Chrome; a few serve a Chrome-*only* one. If a site misbehaves, flip it off. |
 | `backgroundWork` | Keeps the page fully alive out of sight: WebKit's window-occlusion suspension is off (video keeps painting under a covered or minimized window) and DOM timers are not throttled in a non-front tab. This costs idle CPU/GPU — which is why it is opt-in per site. |
+| `appMode` | Treats the page as a native app — a live terminal or remote desktop where browser chrome is in the way. ⌃Tab and F12 reach the page instead of switching tabs or popping the inspector; the browser's right-click menu is suppressed so the page's own rules the click; two-finger back/forward swipes are off; and closing a tab or window, reloading, going home, or quitting asks first — every one of them ends the session the moment the page unloads. |
 
-Currently: `remotedesktop.google.com` gets all three; `orca-win.haiho.net` gets `keepAwake` and `backgroundWork`. On launch the app also preconnects to these hosts and to every quick-access host, so the first navigation skips the DNS+TCP+TLS handshake.
+Keys are host patterns: an exact hostname, or one `*` standing for any run of characters — `ssh*.haiho.net` covers every SSH box under that domain now and later. An exact host beats a pattern; a file entry beats the built-in table. On launch the app also preconnects to every literal host listed, so the first navigation skips the DNS+TCP+TLS handshake.
+
+The same Settings window lists the zoom level each site remembered and clears it back to 100%, and toggles the AI button and profile chip in the corner.
 
 ## Ad blocking
 

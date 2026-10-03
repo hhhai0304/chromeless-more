@@ -525,7 +525,7 @@ private let startPageTemplate = #"""
   <footer>&#8984;N profile window &nbsp;&middot;&nbsp; &#8679;&#8984;J downloads &nbsp;&middot;&nbsp; &#8984;R reload &nbsp;&middot;&nbsp; &#8984;W close tab &nbsp;&middot;&nbsp; &#8679;&#8984;W close window
   <br>hover a link and its address shows bottom-left &nbsp;&middot;&nbsp; sites that ask for camera, mic, location, or notifications get a real prompt now
   <br>quick access: click a tile to go, &#8984;-click for a background tab, &#9998; to edit &mdash; icons fetch themselves
-  <br>filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b>
+  <br>site tweaks and site zooms live in <b>&#8984;, Settings</b> &mdash; filter lists, your own rules, and the sites you allowed live in <b>View &rsaquo; Ad Blocking</b>
   <br>ai sidebar: add a provider &mdash; openrouter, chatgpt, gemini, claude, ollama&hellip; &mdash; and its models in <b>View &rsaquo; AI Settings</b>, then <kbd>&#8679;&#8984;A</kbd> asks about the page you are on
   <br>the sidebar header switches model per tab, from the ones you added
   <br><b>View &rsaquo; Show AI Button</b> parks a small &#10022; next to the profile chip for the same thing</footer>
@@ -974,30 +974,6 @@ window.__clf = window.__clf || (function () {
 })();
 """
 
-// Heavyweight interactive apps — remote desktops, live terminals — benefit
-// from treatment a normal page should not get. Anything here is granted by
-// host only, so a random site never earns the same freedom.
-private struct SiteTweaks {
-    /// Hold off App Nap, idle sleep, and display sleep while the site is the
-    /// active tab of a visible window — a remote session must not freeze
-    /// because the local screen went dark.
-    var keepAwake = false
-    /// Present a Chrome user agent. Some Google apps serve a faster path to
-    /// Chrome — or a Chrome-only one; if the site misbehaves, flip this off.
-    var chromeUserAgent = false
-    /// Keep the page fully alive in the background: no window-occlusion
-    /// suspension (video keeps painting under a covered or minimized window)
-    /// and no DOM timer throttling in a non-front tab. Costs idle CPU/GPU —
-    /// that is the trade, and it is why it is per site.
-    var backgroundWork = false
-}
-
-private let siteTweaks: [String: SiteTweaks] = [
-    "remotedesktop.google.com": SiteTweaks(
-        keepAwake: true, chromeUserAgent: true, backgroundWork: true),
-    "orca-win.haiho.net": SiteTweaks(
-        keepAwake: true, backgroundWork: true),
-]
 
 // A recent desktop Chrome on macOS — generic enough to pass a UA check
 // without promising a WebKit feature the site might then call.
@@ -1713,8 +1689,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func closeTab(at index: Int, recordClosed: Bool = true) {
         guard tabs.indices.contains(index) else { return }
-        // Closing the only tab closes the window, so ⌘W keeps its old meaning.
+        // Closing the only tab closes the window, so ⌘W keeps its old meaning
+        // — and windowShouldClose is what asks about the session inside it.
         if tabs.count == 1 { window?.performClose(nil); return }
+        guard confirmLeavingSessions(in: [tabs[index]], verb: "Close") else { return }
         if index == activeIndex { hideFindBar() }
         let tab = tabs.remove(at: index)
         // The URL is all a reopen gets back — the page's own back-forward list
@@ -1839,6 +1817,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self, event.window === self.window else { return event }
+            // A live session owns every key the page can see — ⌃Tab and F12
+            // reach the terminal instead of switching tabs or popping the
+            // inspector.
+            if isSessionHost(self.activeTab.webView.url) { return event }
             let mods = event.modifierFlags
                 .intersection(.deviceIndependentFlagsMask)
                 .subtracting([.function, .numericPad, .capsLock])
@@ -2962,6 +2944,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     }
 
     private func closeOtherTabs(than index: Int) {
+        guard confirmLeavingSessions(
+            in: tabs.enumerated().filter { $0.offset != index }.map(\.element),
+            verb: "Close") else { return }
         let keep = tabs[index]
         for (i, tab) in tabs.enumerated() where i != index {
             recordClosedTab(tab)
@@ -2974,6 +2959,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     private func closeTabsToRight(of index: Int) {
         guard index + 1 < tabs.count else { return }
+        guard confirmLeavingSessions(
+            in: Array(tabs[(index + 1)...]), verb: "Close") else { return }
         for tab in tabs[(index + 1)...] {
             recordClosedTab(tab)
             tab.teardown()
@@ -3058,7 +3045,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     /// just gets stock behavior.
     private func applySiteTweaks(to tab: Tab) {
         let host = tab.webView.url?.host?.lowercased() ?? ""
-        let tweaks = siteTweaks[host]
+        let tweaks = tweaksForHost(host)
         let stayLive = tweaks?.backgroundWork == true
         let wv = tab.webView
         // Occlusion off: a covered or minimized window no longer suspends
@@ -3072,7 +3059,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if prefs.responds(to: Selector(("_setHiddenPageDOMTimerThrottlingEnabled:"))) {
             prefs.setValue(!stayLive, forKey: "hiddenPageDOMTimerThrottlingEnabled")
         }
+        // A two-finger swipe back lands wherever the session's auth redirect
+        // came from — a dead page. On session hosts the gesture is off.
+        wv.allowsBackForwardNavigationGestures = tweaks?.appMode != true
         refreshKeepAwake()
+    }
+
+    /// Live sessions die with their page, so anything that unloads one asks
+    /// first. `verb` fills both the sentence and the confirm button.
+    private func confirmLeavingSessions(in doomedTabs: [Tab], verb: String) -> Bool {
+        let hosts = doomedTabs
+            .filter { isSessionHost($0.webView.url) }
+            .compactMap { $0.webView.url?.host }
+        guard !hosts.isEmpty else { return true }
+        let alert = NSAlert()
+        alert.messageText = "\(verb) disconnects the session on \(hosts.joined(separator: ", "))."
+        alert.addButton(withTitle: verb)
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// While a keep-awake site is the active tab of a visible window, hold an
@@ -3081,7 +3085,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     /// released the moment the tab, the page, or the window no longer asks.
     private func refreshKeepAwake() {
         let host = activeTab.webView.url?.host?.lowercased() ?? ""
-        let wants = siteTweaks[host]?.keepAwake == true && window?.isVisible == true
+        let wants = tweaksForHost(host)?.keepAwake == true && window?.isVisible == true
         if wants && keepAwakeActivity == nil {
             keepAwakeActivity = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiated, .idleDisplaySleepDisabled],
@@ -3100,7 +3104,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     /// included, so `localhost:3000` and `:8080` are different sites), kept in
     /// UserDefaults so every window shares it, applied on each committed
     /// navigation, and an absent key meaning 100%.
-    private let siteZoomDefaultsKey = "ChromelessSiteZooms"
 
     private func siteZoomKey(for url: URL?) -> String? {
         guard let url else { return nil }
@@ -3146,7 +3149,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             else { continue }
             origins.insert("https://\(host)")
         }
-        for host in siteTweaks.keys { origins.insert("https://\(host)") }
+        // Patterns and comment keys can't be preconnected — only literal
+        // hosts warm a socket.
+        for key in Array(siteTweaks.keys) + Array(userSiteTweaks().keys)
+        where !key.contains("*") && !key.hasPrefix("_") {
+            origins.insert("https://\(key)")
+        }
         for origin in origins {
             if let u = URL(string: origin) { _ = webView.perform(sel, with: u) }
         }
@@ -3325,11 +3333,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     @objc func openLocation(_ sender: Any?) { showHUD() }
 
     @objc func reloadPage(_ sender: Any?) {
-        if activeTab.onStartPage { loadStartPage() } else { webView.reload() }
+        if activeTab.onStartPage { loadStartPage(); return }
+        guard confirmLeavingSessions(in: [activeTab], verb: "Reload") else { return }
+        webView.reload()
     }
 
     @objc func hardReloadPage(_ sender: Any?) {
-        if activeTab.onStartPage { loadStartPage() } else { webView.reloadFromOrigin() }
+        if activeTab.onStartPage { loadStartPage(); return }
+        guard confirmLeavingSessions(in: [activeTab], verb: "Reload") else { return }
+        webView.reloadFromOrigin()
     }
 
     // WebKit exposes no public way to open the inspector — `isInspectable`
@@ -3361,8 +3373,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         return (inspector.value(forKey: "isVisible") as? Bool) ?? false
     }
 
-    @objc func goBackAction(_ sender: Any?) { webView.goBack() }
-    @objc func goForwardAction(_ sender: Any?) { webView.goForward() }
+    @objc func goBackAction(_ sender: Any?) {
+        guard !isSessionHost(webView.url) else { return }
+        webView.goBack()
+    }
+    @objc func goForwardAction(_ sender: Any?) {
+        guard !isSessionHost(webView.url) else { return }
+        webView.goForward()
+    }
 
     @objc func zoomInPage(_ sender: Any?) {
         webView.pageZoom = min(webView.pageZoom * 1.1, 5.0)
@@ -3409,9 +3427,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         showToast(pinned ? "Unpinned" : "Pinned on top")
     }
 
-    @objc func showHelpPage(_ sender: Any?) { loadStartPage() }
+    @objc func showHelpPage(_ sender: Any?) {
+        guard confirmLeavingSessions(in: [activeTab], verb: "Leave") else { return }
+        loadStartPage()
+    }
 
-    @objc func goHome(_ sender: Any?) { loadStartPage() }
+    @objc func goHome(_ sender: Any?) {
+        guard confirmLeavingSessions(in: [activeTab], verb: "Leave") else { return }
+        loadStartPage()
+    }
 
     // MARK: Ad blocking
 
@@ -3525,8 +3549,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
-        case #selector(goBackAction(_:)): return webView.canGoBack
-        case #selector(goForwardAction(_:)): return webView.canGoForward
+        case #selector(goBackAction(_:)):
+            return webView.canGoBack && !isSessionHost(webView.url)
+        case #selector(goForwardAction(_:)):
+            return webView.canGoForward && !isSessionHost(webView.url)
         case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)):
             return tabs.count > 1
         case #selector(selectTabByNumber(_:)):
@@ -3550,7 +3576,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             return !activeTab.onStartPage && webView.url != nil
         case #selector(toggleWebInspector(_:)):
             menuItem.title = isWebInspectorVisible ? "Hide Web Inspector" : "Show Web Inspector"
-            return webInspector != nil
+            // Disabled items match no key equivalent — on a session host F12
+            // falls through the menu into the page, where it belongs.
+            return webInspector != nil && !isSessionHost(webView.url)
         case #selector(toggleAISidebar(_:)):
             menuItem.state = aiSidebarShown ? .on : .off
             return true
@@ -3572,6 +3600,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     // Minimizing or hiding the app flips isVisible — a keep-awake session only
     // holds the display while the window can actually be seen.
     func windowDidChangeOcclusionState(_ notification: Notification) { refreshKeepAwake() }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Quit already asked once for every window — asking again per window
+        // would double-prompt on the way out.
+        if (NSApp.delegate as? AppDelegate)?.sessionCloseApproved == true { return true }
+        return confirmLeavingSessions(in: tabs, verb: "Close")
+    }
 
     func windowWillClose(_ notification: Notification) {
         if let activity = keepAwakeActivity {
@@ -3740,7 +3775,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
            let url = navigationAction.request.url,
            let host = url.host?.lowercased(),
            ["http", "https"].contains(url.scheme ?? "") {
-            let wantUA = siteTweaks[host]?.chromeUserAgent == true ? chromeUserAgentString : nil
+            let wantUA = tweaksForHost(host)?.chromeUserAgent == true ? chromeUserAgentString : nil
             // The getter reports "" for "no override" on newer WebKit, not nil —
             // comparing raw would restart every navigation forever.
             let haveUA = webView.customUserAgent?.isEmpty == false ? webView.customUserAgent : nil
@@ -3858,6 +3893,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         closeTab(at: index, recordClosed: false)
     }
 
+    // SPI from WKUIDelegatePrivate: WebKit offers the context menu it built
+    // and shows whatever comes back — nil shows nothing at all. On a live
+    // session the right-click belongs to the page; the browser's items are
+    // noise, and half of them (Back, Reload) would kill the session anyway.
+    @objc(_webView:getContextMenuFromProposedMenu:forElement:userInfo:completionHandler:)
+    func webView(_ webView: WKWebView, getContextMenuFromProposedMenu menu: NSMenu,
+                 forElement elementInfo: Any, userInfo: Any?,
+                 completionHandler: @escaping (NSMenu?) -> Void) {
+        completionHandler(isSessionHost(webView.url) ? nil : menu)
+    }
+
     func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String,
                  initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) {
         let alert = NSAlert()
@@ -3944,12 +3990,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource, NSTableViewDelegate {
     var controllers: [BrowserWindowController] = []
+    /// Set once the quit prompt over live sessions is answered yes — the
+    /// per-window close check reads it and stops asking.
+    var sessionCloseApproved = false
     private var profilePickerProfiles: [BrowserProfile] = []
     private var profilePickerSelectedID: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+        seedSiteTweaksFile()
 
         // Compiling takes a moment, and the first page can load before the list
         // is ready. Reloading it out from under the user to catch a handful of
@@ -4022,7 +4072,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
     // Closing the last window quits the app, so without this a download that is
     // 90% done dies silently when you close the window it started from.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard downloadManager.hasActiveDownloads, launchOptions.snap == nil else { return .terminateNow }
+        guard launchOptions.snap == nil else { return .terminateNow }
+        // A live session dies with its window — one quit prompt for all of
+        // them, then windowShouldClose stands down via sessionCloseApproved.
+        if !sessionCloseApproved {
+            let hosts = controllers.flatMap(\.tabs)
+                .filter { isSessionHost($0.webView.url) }
+                .compactMap { $0.webView.url?.host }
+            if !hosts.isEmpty {
+                let alert = NSAlert()
+                alert.messageText = "Quitting disconnects the session on \(hosts.joined(separator: ", "))."
+                alert.addButton(withTitle: "Quit")
+                alert.addButton(withTitle: "Cancel")
+                if alert.runModal() != .alertFirstButtonReturn { return .terminateCancel }
+                sessionCloseApproved = true
+            }
+        }
+        guard downloadManager.hasActiveDownloads else { return .terminateNow }
         let alert = NSAlert()
         alert.messageText = "A download is still in progress."
         alert.informativeText = "Quitting now cancels it."
@@ -4032,8 +4098,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
             downloadManager.cancelAll()
             return .terminateNow
         }
+        // Staying alive after all — the next quit asks about sessions again.
+        sessionCloseApproved = false
         return .terminateCancel
     }
+    @objc func showSettings(_ sender: Any?) {
+        SettingsWindowController.shared.present()
+    }
+
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 
     func application(_ application: NSApplication, open urls: [URL]) {
@@ -4213,6 +4285,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About Chromeless",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: ",")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Chromeless", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = appMenu.addItem(withTitle: "Hide Others",
