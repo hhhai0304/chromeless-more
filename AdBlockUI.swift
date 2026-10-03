@@ -31,14 +31,16 @@ let adBlockPickerScript = #"""
 
   // The confirm panel docks at the bottom, clear of whatever the highlight is
   // covering, and keeps pointer events so its buttons can be clicked — the
-  // document-level handlers below bail out for anything inside it.
+  // document-level handlers below bail out for anything inside it. Its width is
+  // fixed so the buttons never move when the selector above them changes
+  // length; the selector itself truncates and shows in full on hover.
   var panel = document.createElement('div');
   panel.style.cssText = 'position:fixed;z-index:2147483647;left:50%;bottom:20px;' +
-    'transform:translateX(-50%);display:none;align-items:center;gap:8px;' +
-    'max-width:86vw;background:rgba(20,20,26,.96);color:#f2f2f7;' +
+    'transform:translateX(-50%);display:none;flex-direction:column;gap:8px;' +
+    'width:380px;background:rgba(20,20,26,.96);color:#f2f2f7;' +
     'border-radius:10px;padding:10px 12px;' +
     'font:12px/1.45 -apple-system,system-ui,sans-serif;' +
-    'box-shadow:0 8px 28px rgba(0,0,0,.5);white-space:nowrap;';
+    'box-shadow:0 8px 28px rgba(0,0,0,.5);';
 
   function panelButton(text, title) {
     var b = document.createElement('button');
@@ -49,19 +51,27 @@ let adBlockPickerScript = #"""
       'background:rgba(255,255,255,.15);color:#f2f2f7;';
     return b;
   }
+  var selLabel = document.createElement('span');
+  selLabel.style.cssText = 'display:block;overflow:hidden;white-space:nowrap;' +
+    'text-overflow:ellipsis;opacity:.85;';
   var shrinkBtn = panelButton('−', 'Shrink the selection');
   var growBtn = panelButton('+', 'Grow the selection');
-  var selLabel = document.createElement('span');
-  selLabel.style.cssText = 'max-width:38vw;overflow:hidden;' +
-    'text-overflow:ellipsis;opacity:.85;';
+  var previewBtn = panelButton('Preview', 'See the page with this element hidden');
+  var spacer = document.createElement('span');
+  spacer.style.flex = '1';
+  var cancelBtn = panelButton('Cancel', 'Back to picking');
   var hideBtn = panelButton('Hide', 'Hide this element and reload the page');
   hideBtn.style.background = '#408cff';
-  var cancelBtn = panelButton('Cancel', 'Back to picking');
-  panel.appendChild(shrinkBtn);
-  panel.appendChild(growBtn);
+  var btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex;align-items:center;gap:8px;';
+  btnRow.appendChild(shrinkBtn);
+  btnRow.appendChild(growBtn);
+  btnRow.appendChild(previewBtn);
+  btnRow.appendChild(spacer);
+  btnRow.appendChild(cancelBtn);
+  btnRow.appendChild(hideBtn);
   panel.appendChild(selLabel);
-  panel.appendChild(hideBtn);
-  panel.appendChild(cancelBtn);
+  panel.appendChild(btnRow);
 
   document.documentElement.appendChild(box);
   document.documentElement.appendChild(hint);
@@ -71,6 +81,29 @@ let adBlockPickerScript = #"""
   var lifted = 0;   // how many levels up from the element under the pointer
   var hovered = null;
   var confirming = false;
+  // Preview hides the current target with inline display:none, the same thing
+  // the compiled rule will do — and keeps enough to put the element's own
+  // inline style back, so a page that set one by hand survives the round trip.
+  var previewEl = null, previewDisplay = '', previewPriority = '';
+
+  function applyPreview() {
+    if (!target || previewEl === target) return;
+    clearPreview();
+    previewEl = target;
+    previewDisplay = target.style.getPropertyValue('display');
+    previewPriority = target.style.getPropertyPriority('display');
+    target.style.setProperty('display', 'none', 'important');
+  }
+
+  function clearPreview() {
+    if (!previewEl) return;
+    if (previewDisplay) {
+      previewEl.style.setProperty('display', previewDisplay, previewPriority);
+    } else {
+      previewEl.style.removeProperty('display');
+    }
+    previewEl = null;
+  }
 
   function stableClass(c) {
     if (!c || c.length > 40) return false;
@@ -132,19 +165,27 @@ let adBlockPickerScript = #"""
   function paint() {
     target = resolve();
     if (!target) { box.style.display = 'none'; return; }
+    // Preview follows the selection: growing or re-picking while previewing
+    // hides the new element and puts the old one back.
+    if (previewEl) applyPreview();
+    var sel = selectorFor(target);
+    selLabel.textContent = sel;
+    selLabel.title = sel;
+    shrinkBtn.style.opacity = lifted > 0 ? '1' : '.35';
+    growBtn.style.opacity = canGrow() ? '1' : '.35';
+    if (previewEl) {
+      box.style.display = 'none';
+      hint.textContent = 'Previewing — Hide to keep it gone';
+      return;
+    }
     var r = target.getBoundingClientRect();
     box.style.display = 'block';
     box.style.left = r.left + 'px';
     box.style.top = r.top + 'px';
     box.style.width = Math.max(0, r.width - 2) + 'px';
     box.style.height = Math.max(0, r.height - 2) + 'px';
-    var sel = selectorFor(target);
-    selLabel.textContent = sel;
-    selLabel.title = sel;
-    shrinkBtn.style.opacity = lifted > 0 ? '1' : '.35';
-    growBtn.style.opacity = canGrow() ? '1' : '.35';
     hint.textContent = confirming
-      ? 'Adjust the size, then Hide — esc quits'
+      ? 'Adjust the size, preview, then Hide — esc quits'
       : sel + '   —   click to select, esc to cancel';
   }
 
@@ -212,14 +253,23 @@ let adBlockPickerScript = #"""
     if (canGrow()) lifted++;
     paint();
   });
+  previewBtn.addEventListener('click', function () {
+    if (previewEl) clearPreview(); else applyPreview();
+    previewBtn.style.background = previewEl
+      ? '#408cff' : 'rgba(255,255,255,.15)';
+    paint();
+  });
   hideBtn.addEventListener('click', commit);
   cancelBtn.addEventListener('click', function () {
+    clearPreview();
+    previewBtn.style.background = 'rgba(255,255,255,.15)';
     confirming = false;
     panel.style.display = 'none';
     paint();
   });
 
   function stop() {
+    clearPreview();
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKey, true);

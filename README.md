@@ -311,9 +311,10 @@ the sites blocking is off for — added there by domain or toggled with ⇧⌘B.
   their ad frames; this is the escape hatch.
 - `⌃⇧⌘E` starts the element picker: hover to highlight, click to select, then
   the panel's `−`/`+` shrink or grow the selection through the element's
-  ancestors and **Hide** confirms — the page reloads right away. **Cancel**
-  goes back to picking, `↑`/`↓` still nudge the size, `esc` quits. The rule is
-  saved as `domain##selector` in your own rules. Picked elements are hidden, not
+  ancestors, **Preview** shows the page with it already hidden, and **Hide**
+  confirms — the page reloads right away. **Cancel** goes back to picking,
+  `↑`/`↓` still nudge the size, `esc` quits. The rule is saved as
+  `domain##selector` in your own rules. Picked elements are hidden, not
   blocked — the bytes still arrive.
 - Rules use AdBlock Plus syntax, so any list in that format can be added.
 
