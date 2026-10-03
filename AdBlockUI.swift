@@ -100,11 +100,15 @@ let adBlockPickerScript = #"""
   // the compiled rule will do — and keeps enough to put the element's own
   // inline style back, so a page that set one by hand survives the round trip.
   var previewEl = null, previewDisplay = '', previewPriority = '';
+  // Where the previewed element was before it vanished — drawn as a dashed
+  // outline so ± steps during preview still show which region is gone.
+  var previewRect = null;
 
   function applyPreview() {
     if (!target || previewEl === target) return;
     clearPreview();
     previewEl = target;
+    previewRect = target.getBoundingClientRect();
     previewDisplay = target.style.getPropertyValue('display');
     previewPriority = target.style.getPropertyPriority('display');
     target.style.setProperty('display', 'none', 'important');
@@ -118,6 +122,7 @@ let adBlockPickerScript = #"""
       previewEl.style.removeProperty('display');
     }
     previewEl = null;
+    previewRect = null;
   }
 
   function stableClass(c) {
@@ -196,10 +201,25 @@ let adBlockPickerScript = #"""
     shrinkBtn.style.opacity = depth > 0 ? '1' : '.35';
     growBtn.style.opacity = canGrow() ? '1' : '.35';
     if (previewEl) {
-      box.style.display = 'none';
-      hint.textContent = 'Previewing — Hide to keep it gone';
+      // The element itself is display:none, so its live rect is zero — the
+      // dashed outline sits where it was, marking the hole the rule will leave.
+      if (previewRect) {
+        var pr = previewRect;
+        box.style.display = 'block';
+        box.style.background = 'transparent';
+        box.style.borderStyle = 'dashed';
+        box.style.left = pr.left + 'px';
+        box.style.top = pr.top + 'px';
+        box.style.width = Math.max(0, pr.width - 2) + 'px';
+        box.style.height = Math.max(0, pr.height - 2) + 'px';
+      } else {
+        box.style.display = 'none';
+      }
+      hint.textContent = 'Previewing ' + sel + ' — Hide keeps it gone';
       return;
     }
+    box.style.background = 'rgba(64,140,255,.22)';
+    box.style.borderStyle = 'solid';
     var r = target.getBoundingClientRect();
     box.style.display = 'block';
     box.style.left = r.left + 'px';
