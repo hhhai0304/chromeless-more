@@ -297,7 +297,7 @@ Some pages are closer to native apps than documents — remote desktops, live te
 
 Keys are host patterns: an exact hostname, or one `*` standing for any run of characters — `ssh*.haiho.net` covers every SSH box under that domain now and later. An exact host beats a pattern; a file entry beats the built-in table. On launch the app also preconnects to every literal host listed, so the first navigation skips the DNS+TCP+TLS handshake.
 
-The same Settings window lists the zoom level each site remembered and clears it back to 100%, and toggles the AI button and profile chip in the corner.
+The same Settings window lists the zoom level each site remembered and clears it back to 100%, and toggles the AI button and profile chip in the corner. It also pins new windows to the primary display — the remembered window frame keeps the screen too, which otherwise reopens windows on whichever monitor they left.
 
 ## Ad blocking
 

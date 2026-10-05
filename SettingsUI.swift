@@ -15,6 +15,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         checkboxWithTitle: "Show AI button in the corner", target: nil, action: nil)
     private let chipCheckbox = NSButton(
         checkboxWithTitle: "Show profile name in the corner", target: nil, action: nil)
+    private let primaryScreenCheckbox = NSButton(
+        checkboxWithTitle: "Open new windows on the primary display", target: nil, action: nil)
     private let tweaksTable = NSTableView()
     private let zoomsTable = NSTableView()
     private let removeTweakButton = NSButton()
@@ -98,6 +100,13 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
         chipCheckbox.font = .systemFont(ofSize: 13)
         chipCheckbox.frame = NSRect(x: margin + 20, y: y, width: inner - 20, height: 20)
         content.addSubview(chipCheckbox)
+
+        y -= 24
+        primaryScreenCheckbox.target = self
+        primaryScreenCheckbox.action = #selector(togglePrimaryScreen)
+        primaryScreenCheckbox.font = .systemFont(ofSize: 13)
+        primaryScreenCheckbox.frame = NSRect(x: margin + 20, y: y, width: inner - 20, height: 20)
+        content.addSubview(primaryScreenCheckbox)
 
         y -= 34
         let tweaksHeader = header("SITE TWEAKS — pages that behave like native apps")
@@ -208,6 +217,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
     private func refresh() {
         aiCheckbox.state = AIButtonPreference.isOn ? .on : .off
         chipCheckbox.state = ProfileChipPreference.isOn ? .on : .off
+        primaryScreenCheckbox.state = PrimaryScreenPreference.isOn ? .on : .off
         patterns = userSiteTweaks().keys.filter { !$0.hasPrefix("_") }.sorted()
         let zooms = UserDefaults.standard.dictionary(forKey: siteZoomDefaultsKey)
             as? [String: Double] ?? [:]
@@ -227,6 +237,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate,
 
     @objc private func toggleChip(_ sender: Any?) {
         ProfileChipPreference.set(chipCheckbox.state == .on)
+    }
+
+    @objc private func togglePrimaryScreen(_ sender: Any?) {
+        PrimaryScreenPreference.set(primaryScreenCheckbox.state == .on)
     }
 
     @objc private func addTweak(_ sender: Any?) {

@@ -853,6 +853,32 @@ enum ProfileChipPreference {
     }
 }
 
+/// The autosaved frame remembers which display the window was on, so a window
+/// quit on a secondary monitor reopens there — fine until the monitor is gone
+/// or unwelcome. On by default: new windows recenter on the primary display
+/// instead. `NSScreen.screens.first` is the primary; `NSScreen.main` just
+/// means "holds the key window".
+enum PrimaryScreenPreference {
+    private static let key = "ChromelessOpenOnPrimaryScreen"
+
+    static var isOn: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+
+    static func set(_ on: Bool) { UserDefaults.standard.set(on, forKey: key) }
+
+    /// Recenters `window` on the primary display, keeping its size, when it
+    /// ended up somewhere else. No-op when the setting is off, there is one
+    /// screen, or the window is already on the primary.
+    static func constrain(_ window: NSWindow) {
+        guard isOn, let primary = NSScreen.screens.first,
+              window.screen != primary else { return }
+        let visible = primary.visibleFrame
+        var frame = window.frame
+        frame.origin = NSPoint(x: visible.midX - frame.width / 2,
+                               y: visible.midY - frame.height / 2)
+        window.setFrame(frame, display: false)
+    }
+}
+
 // MARK: - Tabs
 
 // WebKit does not treat a middle-click on a link as a request for a new window
@@ -1635,12 +1661,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
         window.center()
         if isPrimary && snap == nil {
+            // macOS 15+ appends the tiling state to the autosaved frame; the
+            // WindowServer then replays the tile at order time — wrong display,
+            // wrong size. Only the plain rect is ours to restore, so the tail
+            // JSON is stripped before the frame goes back in.
+            let frameKey = "NSWindow Frame ChromelessMain-\(profile.id)"
+            if let saved = UserDefaults.standard.string(forKey: frameKey),
+               let brace = saved.firstIndex(of: "{") {
+                UserDefaults.standard.set(String(saved[..<brace]), forKey: frameKey)
+            }
             window.setFrameUsingName("ChromelessMain-\(profile.id)")
             window.setFrameAutosaveName("ChromelessMain-\(profile.id)")
         } else if let key = NSApp.keyWindow {
             window.setFrameTopLeftPoint(NSPoint(x: key.frame.minX + 30, y: key.frame.maxY - 30))
         }
         if let size { window.setContentSize(size) }
+        // After the saved/cascaded frame is final: the setting pulls windows
+        // back onto the primary display — the whole point of it.
+        if snap == nil { PrimaryScreenPreference.constrain(window) }
 
         installMouseMonitor()
         installKeyMonitor()
@@ -4155,6 +4193,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         controllers.append(controller)
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
+        // Placement is only final once the window is ordered: the
+        // WindowServer may still re-place a restored frame between init and
+        // here (tiling state, space bookkeeping), so where it actually landed
+        // is what counts. The second pass catches stragglers that move after
+        // the first ordering settles.
+        if snap == nil, let window = controller.window {
+            DispatchQueue.main.async { PrimaryScreenPreference.constrain(window) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                PrimaryScreenPreference.constrain(window)
+            }
+        }
     }
 
     @objc func newWindow(_ sender: Any?) { presentProfilePicker(from: nil) }
