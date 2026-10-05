@@ -682,6 +682,16 @@ final class AISidebarView: NSVisualEffectView, NSTextViewDelegate {
         guard let window else { return }
         let start = window.contentView?.convert(event.locationInWindow, from: nil) ?? .zero
         guard start.x - frame.minX <= Self.grabWidth else {
+            // The sidebar reaching into the titlebar strip is why the window
+            // is `isMovable = false`, so its header has to move the window by
+            // hand — and run the titlebar double-click itself. The grab edge
+            // keeps precedence even in the corner: a resize is not a drag.
+            let local = convert(event.locationInWindow, from: nil)
+            if local.y > bounds.height - Self.headerHeight {
+                if event.clickCount == 2 { performTitlebarDoubleClick(on: window) }
+                else { window.performDrag(with: event) }
+                return
+            }
             super.mouseDown(with: event)
             return
         }

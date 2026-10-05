@@ -1239,9 +1239,14 @@ final class TabItemView: NSView {
 
     // Selecting on press is what every browser does, so it happens before the
     // drag is even considered; the bar decides afterwards whether the gesture
-    // turns into a reorder.
+    // turns into a reorder. A double press is the titlebar double-click — the
+    // whole strip reads as the titlebar, so tabs zoom the window too.
     override func mouseDown(with event: NSEvent) {
         onSelect?(self)
+        if event.clickCount == 2 {
+            performTitlebarDoubleClick(on: window)
+            return
+        }
         onDragBegin?(self, event)
     }
 
@@ -1277,6 +1282,19 @@ final class TabItemView: NSView {
         let labelRight: CGFloat = closeButton.isHidden ? 8 : 22
         label.frame = NSRect(x: labelX, y: (b.height - 15) / 2,
                              width: max(0, b.width - labelX - labelRight), height: 15)
+    }
+}
+
+// Our fake titlebar strips are plain views once `isMovable` is off, so the
+// system's titlebar double-click does not reach them. Mirror the global
+// "double-click a window's title bar" preference: Zoom by default, Minimize
+// or nothing when the user set it so.
+func performTitlebarDoubleClick(on window: NSWindow?) {
+    guard let window else { return }
+    switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+    case "Minimize": window.miniaturize(nil)
+    case "None": break
+    default: window.zoom(nil)
     }
 }
 
@@ -1323,9 +1341,14 @@ final class TabBarView: NSVisualEffectView {
     @objc private func addClicked() { onNewTab?() }
 
     // With the tab bar up, the window is `isMovable = false` (see `refreshTabs`),
-    // so the empty part of the strip has to move the window by hand. Presses on
-    // a tab never reach here — items are subviews and take their own events.
+    // so the empty part of the strip has to move the window by hand — and handle
+    // the titlebar double-click too, since the system no longer sees it. Presses
+    // on a tab never reach here — items are subviews and take their own events.
     override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            performTitlebarDoubleClick(on: window)
+            return
+        }
         window?.performDrag(with: event)
     }
 
