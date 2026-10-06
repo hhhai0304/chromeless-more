@@ -71,6 +71,7 @@ struct LaunchOptions {
     var profile: String? = nil
     var listProfiles = false
     var privateWindow = false
+    var remote = false
 }
 
 func parseLaunchOptions() -> LaunchOptions {
@@ -94,6 +95,7 @@ func parseLaunchOptions() -> LaunchOptions {
               --profile <name>  use a specific profile
               --profiles        list profiles and exit
               --private         open a private window (nothing is saved)
+              --remote          listen on the control socket so tools can drive the browser
               --adblock-selftest  check the filter converter and exit
               --adblock-compiletest  convert every installed list and compile it for real
 
@@ -124,6 +126,8 @@ func parseLaunchOptions() -> LaunchOptions {
             opts.listProfiles = true
         case "--private":
             opts.privateWindow = true
+        case "--remote":
+            opts.remote = true
         case "--adblock-selftest":
             runAdBlockSelfTest()
         case "--adblock-compiletest":
@@ -1133,6 +1137,14 @@ final class Tab {
     /// same-site navigations do not refetch, and a different site clears it.
     var favicon: NSImage?
     var faviconHost: String?
+    /// A tab the control socket opened. Remote commands only ever reach agent
+    /// tabs — the user's own tabs refuse them — so this flag is the whole
+    /// permission boundary. Marked orange: an "AI" pill in the tab bar, a
+    /// border on the page, and a rail the probe draws at the top of it.
+    var isAgent = false
+    /// The agent's debugging feed — console, page errors, fetch/XHR — filled
+    /// by the probe script only agent-tab configurations carry.
+    let agentLog = AgentLog()
 
     init(webView: BrowserWebView) { self.webView = webView }
 
@@ -1167,11 +1179,15 @@ final class TabItemView: NSView {
     private let iconView = NSImageView()
     private let label = NSTextField(labelWithString: "")
     private let closeButton = NSButton()
+    private let agentBadge = NSTextField(labelWithString: "AI")
     private var hovering = false
     private var trackingAreaRef: NSTrackingArea?
     private var middleDownInside = false
 
     var isActive = false { didSet { applyStyle(); needsLayout = true } }
+    // An agent tab wears its ownership on the item: the whole body goes
+    // orange and a small "AI" pill sits where the icon would otherwise start.
+    var isAgent = false { didSet { applyStyle(); needsLayout = true } }
     var title = "" {
         didSet {
             label.stringValue = title
@@ -1215,6 +1231,17 @@ final class TabItemView: NSView {
         closeButton.isHidden = true
         addSubview(closeButton)
 
+        agentBadge.font = .systemFont(ofSize: 8.5, weight: .bold)
+        agentBadge.textColor = .white
+        agentBadge.backgroundColor = .systemOrange
+        agentBadge.drawsBackground = true
+        agentBadge.isBezeled = false
+        agentBadge.alignment = .center
+        agentBadge.wantsLayer = true
+        agentBadge.layer?.cornerRadius = 3
+        agentBadge.isHidden = true
+        addSubview(agentBadge)
+
         applyStyle()
     }
 
@@ -1223,10 +1250,16 @@ final class TabItemView: NSView {
     @objc private func closeClicked() { onClose?(self) }
 
     private func applyStyle() {
-        layer?.backgroundColor = isActive
-            ? NSColor.white.withAlphaComponent(0.14).cgColor
-            : (hovering ? NSColor.white.withAlphaComponent(0.07).cgColor : NSColor.clear.cgColor)
+        if isAgent {
+            layer?.backgroundColor = NSColor.systemOrange.withAlphaComponent(
+                isActive ? 0.35 : (hovering ? 0.22 : 0.14)).cgColor
+        } else {
+            layer?.backgroundColor = isActive
+                ? NSColor.white.withAlphaComponent(0.14).cgColor
+                : (hovering ? NSColor.white.withAlphaComponent(0.07).cgColor : NSColor.clear.cgColor)
+        }
         label.textColor = isActive ? .labelColor : .secondaryLabelColor
+        agentBadge.isHidden = !isAgent
     }
 
     override func updateTrackingAreas() {
@@ -1304,7 +1337,9 @@ final class TabItemView: NSView {
         let b = bounds
         closeButton.frame = NSRect(x: b.width - 20, y: (b.height - 16) / 2, width: 16, height: 16)
         iconView.frame = NSRect(x: 8, y: (b.height - 14) / 2, width: 14, height: 14)
-        let labelX: CGFloat = iconView.isHidden ? 9 : 27
+        agentBadge.frame = NSRect(x: iconView.isHidden ? 8 : 27,
+                                  y: (b.height - 13) / 2, width: 17, height: 13)
+        let labelX: CGFloat = isAgent ? agentBadge.frame.maxX + 5 : (iconView.isHidden ? 9 : 27)
         let labelRight: CGFloat = closeButton.isHidden ? 8 : 22
         label.frame = NSRect(x: labelX, y: (b.height - 15) / 2,
                              width: max(0, b.width - labelX - labelRight), height: 15)
@@ -1388,7 +1423,7 @@ final class TabBarView: NSVisualEffectView {
     // Items are reused across rebuilds rather than recreated. A drag holds on
     // to the view it is moving, and selecting a tab rebuilds the bar, so tearing
     // the views down would kill the gesture on its first frame.
-    func rebuild(titles: [String], activeIndex: Int) {
+    func rebuild(titles: [String], activeIndex: Int, agents: [Bool] = []) {
         while items.count > titles.count {
             let gone = items.removeLast()
             if gone === dragItem { dragItem = nil }
@@ -1407,6 +1442,7 @@ final class TabBarView: NSVisualEffectView {
             item.index = index
             item.title = titles[index]
             item.isActive = index == activeIndex
+            item.isAgent = index < agents.count && agents[index]
         }
         needsLayout = true
     }
@@ -1699,6 +1735,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private func configure(_ tab: Tab) {
         let wv = tab.webView
         wv.autoresizingMask = [.width, .height]
+        // The page rail marks an agent tab inside the page; this marks the
+        // edge of its view, so the border is still visible while the rail is
+        // scrolled past or the page simply hasn't painted yet.
+        if tab.isAgent {
+            wv.wantsLayer = true
+            wv.layer?.borderWidth = 2
+            wv.layer?.borderColor = NSColor.systemOrange.cgColor
+        }
         wv.onQuickAccess = { [weak self] source, body in self?.handleQuickAccess(body, from: source) }
         wv.onOpenLinkInNewTab = { [weak self] url, background in
             _ = self?.addTab(url: url, activate: !background)
@@ -1745,9 +1789,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     // `configuration` is non-nil only when WebKit hands us one for window.open
     // or target=_blank; in that case WebKit drives the load itself.
     @discardableResult
-    func addTab(url: URL?, configuration: WKWebViewConfiguration? = nil, activate: Bool = true) -> Tab {
+    func addTab(url: URL?, configuration: WKWebViewConfiguration? = nil,
+                activate: Bool = true, agent: Bool = false) -> Tab {
         let conf = configuration ?? makeWebConfiguration(for: profile, isPrivate: isPrivate)
         let tab = Tab(webView: BrowserWebView(frame: .zero, configuration: conf))
+        // Set before configure+refreshTabs so the badge and border are right
+        // from the first paint.
+        tab.isAgent = agent
         configure(tab)
         tabs.append(tab)
         if activate { activeIndex = tabs.count - 1 }
@@ -1755,6 +1803,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         if configuration == nil {
             if let url { load(url, in: tab) } else { loadStartPage(in: tab) }
         }
+        return tab
+    }
+
+    /// The tab a remote `open` makes: agent-owned from birth, always in the
+    /// background so nothing remote takes the user's foreground, and built on
+    /// the instrumented configuration that feeds `logs`.
+    func addAgentTab(url: URL) -> Tab {
+        let conf = makeAgentConfiguration(for: profile, isPrivate: isPrivate)
+        let tab = addTab(url: nil, configuration: conf, activate: false, agent: true)
+        load(url, in: tab)
         return tab
     }
 
@@ -1804,13 +1862,30 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     private func refreshTabs() {
         guard let container = window?.contentView else { return }
-        for tab in tabs where tab !== activeTab && tab.webView.superview != nil {
-            tab.webView.removeFromSuperview()
+        for tab in tabs where tab !== activeTab {
+            if tab.isAgent {
+                // Background agent tabs stay attached, parked under the
+                // user's page — hidden or detached web views stop rendering,
+                // and `snap` is how a remote agent sees the pages it drives.
+                // Re-adding one that was just active parks it back at the
+                // bottom of the stack. The frame is set by hand: autoresizing
+                // only stretches a view when the container resizes, and a
+                // parked view may be attached after that resize happened.
+                tab.webView.frame = container.bounds
+                container.addSubview(tab.webView, positioned: .below, relativeTo: nil)
+            } else if tab.webView.superview != nil {
+                tab.webView.removeFromSuperview()
+            }
         }
-        if activeTab.webView.superview == nil {
-            container.addSubview(activeTab.webView, positioned: .below, relativeTo: tabBar)
+        if activeTab.webView.superview == nil || activeTab.isAgent {
+            // Re-adding a parked agent view lifts it back above the others.
+            activeTab.webView.frame = container.bounds
+            container.addSubview(activeTab.webView, positioned: .below,
+                                 relativeTo: tabBar)
         }
-        tabBar.rebuild(titles: tabs.map(\.displayTitle), activeIndex: activeIndex)
+        activeTab.webView.isHidden = false
+        tabBar.rebuild(titles: tabs.map(\.displayTitle), activeIndex: activeIndex,
+                       agents: tabs.map(\.isAgent))
         for (index, tab) in tabs.enumerated() {
             tabBar.update(iconAt: index, to: tab.favicon)
         }
@@ -2196,6 +2271,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     @objc func toggleProfileChip(_ sender: Any?) {
         ProfileChipPreference.set(!ProfileChipPreference.isOn)
+    }
+
+    @objc func showRemoteSettings(_ sender: Any?) {
+        RemoteSettingsWindowController.shared.present()
     }
 
     private func setAISidebar(visible: Bool) {
@@ -4013,7 +4092,33 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         // Handing back a live web view lets WebKit drive the load itself, so
         // window.open + document.write popups work, not just plain links.
-        return addTab(url: nil, configuration: configuration).webView
+        // A popup born of an AI tab is still the agent's page doing the
+        // asking, so it keeps agent ownership — and gets the instrumentation
+        // and the orange marking its parent had. It also stays in the
+        // background like every other agent birth; activating it would take
+        // the user's foreground. The configuration WebKit hands over carries
+        // the opener's user content controller, so the handler is already on
+        // it — adding one by the same name crashes, hence remove-first (a
+        // no-op when absent) and membership checks for the scripts.
+        let agentPopup = tab(for: webView)?.isAgent == true
+        if agentPopup {
+            let ucc = configuration.userContentController
+            ucc.removeScriptMessageHandler(forName: AgentLogRouter.messageName)
+            ucc.add(AgentLogRouter.shared, name: AgentLogRouter.messageName)
+            let existing = ucc.userScripts.map(\.source)
+            if !existing.contains(agentProbeScript) {
+                ucc.addUserScript(WKUserScript(
+                    source: agentProbeScript, injectionTime: .atDocumentStart,
+                    forMainFrameOnly: false))
+            }
+            if !existing.contains(agentRailScript) {
+                ucc.addUserScript(WKUserScript(
+                    source: agentRailScript, injectionTime: .atDocumentStart,
+                    forMainFrameOnly: true))
+            }
+        }
+        return addTab(url: nil, configuration: configuration,
+                      activate: !agentPopup, agent: agentPopup).webView
     }
 
     func webViewDidClose(_ webView: WKWebView) {
@@ -4179,6 +4284,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 fputs("chromeless: --snap timed out\n", stderr)
                 exit(2)
             }
+        } else {
+            remoteControl.startIfEnabled()
         }
     }
 
@@ -4529,6 +4636,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                          action: #selector(BrowserWindowController.showAISettings(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Translate Selection on ⇧",
                          action: #selector(BrowserWindowController.toggleTranslateOnShift(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Remote Control…",
+                         action: #selector(BrowserWindowController.showRemoteSettings(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let siteBlocking = viewMenu.addItem(
             withTitle: "Block Ads on This Site",

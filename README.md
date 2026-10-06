@@ -353,6 +353,7 @@ usage: chromeless [url] [options]
   --profile <name>  use a specific profile
   --profiles        list profiles and exit
   --private         open a private window (nothing is saved)
+  --remote          listen on the control socket so tools can drive the browser
   --adblock-selftest    check the filter converter and exit
   --adblock-compiletest convert every installed list and compile it for real
 ```
@@ -373,6 +374,50 @@ Chromeless doubles as a webpage-to-PNG tool:
 ```
 
 It loads the page, waits for it to settle, writes a Retina PNG, and exits.
+
+## Remote control
+
+**View ▸ Remote Control…** opens a window with one switch: *listen for
+commands on the control socket*. It is off by default. On — or launched with
+`--remote` — and anything running as you can drive the browser through a unix
+socket at
+
+```text
+~/Library/Application Support/Chromeless/control.sock
+```
+
+The wire is one JSON object per line each way: send `{"cmd":"windows"}`, get
+back every window and tab with indexes for targeting — and an `agent` flag on
+each. `open` and `navigate` take the same bare-domain-or-search input as `⌘L`;
+`eval` runs JavaScript and awaits promises; `snap` writes a PNG or returns it
+base64; `logs` reads the AI tab's console, page errors, and fetch/XHR calls;
+`back`, `forward`, `reload`, `stop`, `activate`, and `close` do what they say.
+The full command list is the header comment of `RemoteControl.swift`.
+
+The sandbox the app enforces, not just suggests: every command runs inside
+**AI tabs** — tabs the socket itself opened, marked orange with an `AI` pill
+in the tab bar, an orange border, and an orange rail at the top of the page.
+Your own tabs refuse commands outright. AI tabs always open in the
+background, popups they spawn stay AI tabs, and nothing remote ever takes
+your foreground — you keep browsing while the agent works alongside you.
+
+Two clients ship in `tools/`: `chromelessctl.py`, a dependency-free CLI that
+adds human actions on top (`click`, `type`, `press`, `wait`, `text`, `html`),
+and `chromeless-mcp.py`, a stdio MCP server that exposes the same surface as
+seventeen tools — screenshots come back as `image/png`, so a vision-capable
+agent can look at the page, not just read its DOM. The settings window's
+**Copy Setup Info** puts the socket path, protocol, and a ready-made MCP
+config on the pasteboard, sized for pasting straight into a chat with your
+agent.
+
+A unix socket rather than a TCP port on purpose: the file's `0600` mode is
+the whole permission model — nothing outside your account can connect — and
+an ad-hoc build never trips the incoming-connections prompt a TCP listener
+raises on every rebuild. Clicks and keystrokes are dispatched as real DOM
+events, which sites can in principle tell apart from a finger; pages that
+actively hunt automation are the only ones that will. And the honest
+warning, same as the keys file: on means *tools can act as you* — your tabs
+are off-limits to them, but every logged-in session is still one `open` away.
 
 ## Notes
 
