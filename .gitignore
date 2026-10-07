@@ -1,6 +1,8 @@
 Chromeless.app/
+Contents/
 Chromeless.icns
 build/
 *.provisionprofile
 .DS_Store
 .omc/
+__pycache__/

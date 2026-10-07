@@ -19,8 +19,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 \
   -target "$ARCH-apple-macos13.0" \
   main.swift Downloads.swift AdBlock.swift AdBlockFilters.swift AdBlockUI.swift QuickAccess.swift \
+  AI.swift AIUI.swift SiteTweaks.swift SettingsUI.swift Translate.swift RemoteControl.swift RemoteUI.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
-  -framework Cocoa -framework WebKit
+  -framework Cocoa -framework WebKit -framework NaturalLanguage
 
 cp Chromeless.icns "$APP/Contents/Resources/Chromeless.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -41,6 +42,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+  <key>NSCameraUsageDescription</key><string>Chromeless asks for the camera only when a site you open requests it.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Chromeless asks for the microphone only when a site you open requests it.</string>
+  <key>NSLocationWhenInUseUsageDescription</key><string>Chromeless asks for your location only when a site you open requests it.</string>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
   <key>NSHumanReadableCopyright</key><string>chromeless — the browser that isn’t there</string>

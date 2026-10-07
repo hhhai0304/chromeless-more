@@ -24,28 +24,216 @@ Everything is a keystroke (also listed on the start page and in the menu bar):
 
 | Keys | Action |
 | --- | --- |
-| `⌘L` | Search or enter a URL (floating HUD) |
+| `⌘L` | Search or enter a URL — suggests history and quick-access links as you type |
+| `⌘F` / `⌘G` `⇧⌘G` | Find in page / next / previous match |
 | `⌘drag` | Move the window from anywhere |
 | `⌃⌘F` | Fullscreen (YouTube's own ⛶ button works too) |
 | `⇧⌘S` | Snapshot the page as PNG → Desktop |
 | `⌘P` | Pin the window above everything |
 | `⌘[` / `⌘]` | Back / forward (two-finger swipe also works) |
 | `⇧⌘H` | Home — back to the start page |
-| `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) |
+| `⌘=` `⌘-` `⌘0` | Zoom in / out / reset (pinch works too) — level is remembered per site |
 | `⇧⌘C` | Copy the current URL |
 | `⌘R` / `⇧⌘R` | Reload / reload ignoring cache |
-| `⌘T` | New tab |
+| `⇧⌘A` | AI sidebar for this tab — ask about the page you are on |
+| `⇧` with text selected | Translate the selection — Vietnamese by default, English if it already is |
+| `⇧⌘J` | Downloads panel |
+| `⌘T` / `⇧⌘T` | New tab / reopen a closed tab |
 | `⌘W` / `⇧⌘W` | Close tab / close the whole window |
 | `⌘1`…`⌘8` `⌘9` | Jump to the nth tab / the last tab |
 | `⌃Tab` / `⌃⇧Tab` | Next / previous tab (`⇧⌘]` `⇧⌘[` too) |
-| `⌘N` | New profile window |
+| `⌘N` / `⇧⌘N` | New profile window / private window |
 | `⇧⌘B` | Block ads on this site — off turns the blocker off for that site only |
 | `⌃⇧⌘E` | Pick an element on the page to hide for good |
+| `⇧⌘⌫` | Clear site data — cookies, cache, storage, and history for one domain |
+| `⌘,` | Settings — site tweaks, site zooms, corner buttons |
 | `F12` | Web Inspector (`⌥⌘I` too) |
 
 The traffic-light buttons exist but stay invisible — hover the top-left corner to reveal them. The active profile name appears as a small chip in the top-right corner; click it to switch profiles. The window remembers its frame per profile. To reopen the last saved page on launch, start it with `--restore`.
-Downloads use the native macOS save panel when a page requests a download or WebKit cannot display the file.
+
+Hovering a link shows its target in a small bubble at the bottom-left — the closest this browser gets to a status bar. `⌘F` opens a find bar that highlights matches as you type (`↩`/`⇧↩` or `⌘G`/`⇧⌘G` walk them). The `⌘L` HUD suggests addresses from the profile's history and your quick-access links; `↓`/`↑` walk the list, `↩` opens the pick. Tabs carry their site's favicon, and a right-click on one offers the usual operations: duplicate, move to a new window, or close the others.
+
+Sites that ask for camera, microphone, location, or notifications get a real prompt instead of a silent refusal — the answer is remembered for the window. A page's own "leave site?" confirm (`beforeunload`) is honoured too.
 File uploads use the native open panel: clicking an `<input type="file">` opens it as a sheet, honouring `multiple` and `webkitdirectory`. Dragging files onto the page works too.
+
+## AI sidebar
+
+`⇧⌘A` slides a chat panel in from the right edge. The page does not move under it —
+the window is split, so the page keeps its own width and nothing overlaps. Drag the
+panel's left edge to resize it; the width is remembered.
+
+**One conversation per tab.** The chat belongs to the tab, not the window: switch
+tabs and the transcript switches with it, half-typed question included. Close the
+tab and it is gone. Two tabs on the same site are two separate threads. Snapshots
+(`⇧⌘S`) still capture the page only, so the sidebar never lands in a screenshot.
+
+**The page goes with the question.** With *Use page* on, the tab's text is read
+fresh on every question — `innerText`, so scripts, styles, and hidden elements are
+already gone — along with the URL, the title, and whatever you have selected. The
+line under the composer says where the context came from and how big it is. Long
+pages are trimmed head-and-tail to the character budget in the settings (24k by
+default, roughly 6k tokens). Only the main frame is readable; cross-origin iframes
+are not.
+
+**A model per tab.** The header names the model this tab is talking to, and it is a
+picker: every model you have added is in it, grouped by provider. Switching there
+switches this tab only — one tab can sit on a big model for a dense page while the
+next stays on a cheap one — and the last pick becomes what new tabs start on. To put
+something new in that list, go to the settings; the sidebar never asks for a URL or
+a key.
+
+### Setting up providers and models
+
+**View ▸ AI Settings…** keeps a list of endpoints and, under each one, the models you
+added. *Add Provider* fills in a base URL from a template; the key is the only thing
+you have to paste:
+
+| Template | Base URL |
+| --- | --- |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| OpenAI (ChatGPT) | `https://api.openai.com/v1` |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| Anthropic (Claude) | `https://api.anthropic.com/v1` |
+| Groq · DeepSeek · xAI · Mistral | their own `/v1` endpoints |
+| Ollama · LM Studio | `http://localhost:11434/v1` · `http://localhost:1234/v1` — no key needed |
+| Custom | whatever serves `POST {base}/chat/completions` |
+
+*Add Models…* asks the endpoint for its catalogue (`GET {base}/models`) and shows it
+as a ticklist with a search box — OpenRouter's few hundred ids are only usable that
+way. Models already added come back ticked and marked *added*, so the list says what
+is there rather than offering it twice. Providers that cannot list — Anthropic — show
+the ids that are known instead, and there is a field for typing one either way. The
+same provider can be added twice under two names if you want two keys against it.
+
+**Models stay out of the sidebar until their provider passes *Check Connection*.**
+The check is a real completion — capped at sixteen tokens, and sent again without the
+cap for the reasoning models that reject it — because a live round trip is the only
+thing that proves the URL, the key, and the credit actually work. It asks with the
+first model added, since the point is the endpoint and not the id; a wrong id fails
+on the first question instead, in the endpoint's own words. On OpenRouter the check
+also reports the key's label and the credit left. Edit the URL or the key afterwards
+and that provider's models drop out of the picker until it is checked again, so a
+typo shows up once instead of on every question.
+
+Everything else in the window — the page-context budget, the default for *Use page*,
+and the system prompt — applies to every provider.
+
+**A busy provider is not a broken one.** Gemini answers `503 UNAVAILABLE` whenever
+the model is loaded, and every one of these endpoints rate-limits. Those replies are
+retried with backoff before anything is said about them, and a question that dies
+that way before its first token arrives is sent once more on its own. Only after
+that does the sidebar show the failure — with the note that the retries are already
+spent, so waiting or picking another model is what is left.
+
+Answers stream in as they are generated; *Stop* keeps what has arrived so far. The
+`＋` button starts a fresh chat in that tab, `⚙` opens these settings, and a link in
+an answer — a markdown link, a bare URL, or an `<autolink>` — opens in a background
+tab.
+
+**View ▸ Show AI Button** parks a small `✦` next to the profile chip for opening the
+sidebar by mouse. It is off by default, because the window is supposed to be the
+page.
+
+Settings live at:
+
+```text
+~/Library/Application Support/Chromeless/ai.json
+```
+
+An `ai.json` from before this list existed — one base URL, one key, one model id — is
+read as a single provider with that model already added, and its passing check is
+kept if it named that exact URL and key. Nothing has to be set up twice.
+
+### What that means for the keys
+
+The keys are in that file in plaintext, and the honest summary is: it is as safe as
+the account you are logged into, and no safer.
+
+* The file is `0600`, owner-only. The mode is set on an empty temporary file before
+  a key is written into it, and that file is then moved into place — writing first
+  and fixing the mode afterwards leaves a world-readable file in between.
+* What records a passing check is a SHA-256 digest of the URL and key, not the key,
+  so the file holds each key exactly once. A stamp written by an older build in the
+  clear is upgraded the first time anything is saved.
+* Nothing logs a key, `--snap` cannot photograph the settings window, and the field
+  shows dots.
+* A key is sent as a `Bearer` header to the base URL of its own provider and nowhere
+  else. If that URL is plain `http://` to another machine, it crosses the network in
+  the clear and the settings window says so — `http://localhost`, which is how Ollama
+  and LM Studio work, does not leave the machine and is not flagged.
+* **It is not encrypted at rest.** Any process running as you can read it, exactly
+  like `~/.ssh/id_rsa` or a `.env`. Full-disk encryption (FileVault) is what protects
+  it when the Mac is off.
+* The Keychain would add a consent prompt for other apps, and was skipped for a
+  concrete reason: a Keychain ACL is tied to the signing identity, and an ad-hoc
+  signature changes with every rebuild, so it would ask for the login password each
+  time the app is rebuilt. A signed, notarised build could keep the keys there — for
+  a browser you rebuild yourself, `0600` is the better trade.
+
+Revoking a key at the provider is still the only thing that makes a leaked key
+harmless, and it takes a minute on every provider listed above.
+
+## What a page can reach
+
+A browser runs code written by strangers, so it is worth writing down what that
+code can touch here.
+
+* **The scripts this app injects live in their own content world.** The middle-click
+  handler, the element picker, the find-in-page engine, and the link-hover reporter
+  talk to the app over `WKScriptMessageHandler`, and a page cannot see those
+  handlers at all — different content world, different global scope. Before that
+  they sat in the page's world, where any site could post to them: opening tabs
+  unprompted, or writing an element-hiding rule for a domain it does not own.
+* **Permission asks go through a real prompt.** Camera, microphone, location, and
+  notification requests get a sheet naming the site; the answer is kept for the
+  window only. Geolocation and notification support use WebKit's private delegate
+  selectors on systems where the public API does not reach — they are called only
+  when WebKit calls them.
+* **The start page's bridge is the exception, and carries a nonce.** It has to live
+  in the page world, because the start page is a page. Every message it sends quotes
+  a random value stamped into that document at load time, and the app drops anything
+  that does not match — another site shares the handler but cannot read the document,
+  so it cannot produce the value. Rejected messages are noted on stderr.
+* **An element-hiding rule is always for the page you are looking at.** The domain
+  comes from the loaded URL, never from the message.
+* **Another app's URL scheme needs a click.** `mailto:`, `zoommtg:`, and the rest are
+  handed to macOS when a link or a form asks for it. A page that navigates itself
+  into a scheme gets a confirmation sheet instead, because otherwise any site could
+  launch any registered handler with no gesture at all.
+* **Downloads are quarantined** — WebKit sets `com.apple.quarantine`, so Gatekeeper
+  still gets its say when you open one — land in `~/Downloads`, never overwrite, and
+  cannot escape that folder: the name is reduced to its last path component.
+* **Profiles are separate WebKit data stores**, so cookies, storage, and caches do
+  not cross between them; a private window uses a non-persistent store.
+* **The state files are owner-only** (`0600`): the shortcuts you keep, the sites you
+  allowed ads on, each profile's last page, and the AI keys.
+
+## Downloads
+
+A download starts the moment a page asks for one — or when WebKit cannot display
+what came back — and a panel slides in over the bottom-right corner to show it. The
+panel hides itself again once nothing is running; `⇧⌘J` pins it open, and pins it
+shut. Its header has *Clear* for the finished rows.
+
+Each row is one file: bytes so far against the total, a progress bar, and one button
+that means whatever the row needs.
+
+| Row state | Button | What it does |
+| --- | --- | --- |
+| Running | `⏸` | Pause. WebKit keeps the partial file. |
+| Paused | `▶` | Resume. Without a server validator there is nothing to resume from, and the row says so — it restarts instead of quietly losing progress. |
+| Finished | *Reveal* | Show it in the Finder. Double-click the row to open it; drag the row into any app to copy the file out. |
+| Failed | *Resume* / *Restart* | Whichever the server left possible. |
+
+Files land in `~/Downloads` under the name the server suggested, reduced to its last
+path component and stripped of anything that would let it escape that folder. An
+existing file is never overwritten — `report.pdf` becomes `report-1.pdf`. WebKit
+marks each one with `com.apple.quarantine`, so Gatekeeper still gets its say when you
+open one.
+
+Hold `⌥` while clicking a download link to pick the location yourself in the native
+save panel instead. Downloads run on the window's own profile session, so a file
+behind a login works with whichever account is signed in there.
 
 ## Quick access
 
@@ -72,7 +260,7 @@ WebKit as a string with no base URL and so has no origin to load an image from.
 
 A window starts with one tab and no tab bar, so nothing changes until you press `⌘T`. From the second tab onward a thin bar appears at the top edge; close back down to one tab and it disappears again. Snapshots (`⇧⌘S`) capture the page only, so the bar never lands in a screenshot.
 
-Every tab in a window shares that window's profile and its cookies. To run two accounts side by side, open a second window with `⌘N` instead. Links with `target="_blank"` and `window.open` popups open as tabs rather than taking over the page. Tabs are not saved between launches.
+Every tab in a window shares that window's profile and its cookies. To run two accounts side by side, open a second window with `⌘N` instead. Links with `target="_blank"` and `window.open` popups open as tabs rather than taking over the page. `⇧⌘T` reopens the last tab you closed (the page reloads; its back-forward list does not come back). Right-click a tab for *Duplicate*, *Move Tab to New Window*, *Close Other Tabs*, and *Close Tabs to the Right*. Tabs are not saved between launches.
 
 ## Profiles
 
@@ -94,6 +282,23 @@ The selected default profile is used when launching without `--profile`, opening
 
 Deleting a profile asks for confirmation and removes its profile metadata plus WebKit website data. Close all windows using that profile before deleting it.
 
+**Private windows** (`⇧⌘N`, or `--private` on the command line) run on a non-persistent WebKit data store: cookies and site data live only for the window's life, nothing is written to the profile's history, and `--restore` does not apply to them. The badge in the corner reads *Private* instead of a profile name. Downloads still land in `~/Downloads` — they are files you asked for, not browsing data.
+
+## Per-site tweaks
+
+Some pages are closer to native apps than documents — remote desktops, live terminals, dashboards left on a second screen. **⌘, → Settings** grants them, by host, four things a normal page never gets — the same table lives in `~/Library/Application Support/Chromeless/site-tweaks.json` if you prefer a file:
+
+| Tweak | What it does |
+| --- | --- |
+| `keepAwake` | While the site is the active tab of a visible window, App Nap, idle system sleep, and display sleep are all held off — a session you are watching never freezes because the screen went dark. |
+| `chromeUserAgent` | Presents a Chrome user agent to the site. Some apps serve a faster path to Chrome; a few serve a Chrome-*only* one. If a site misbehaves, flip it off. |
+| `backgroundWork` | Keeps the page fully alive out of sight: WebKit's window-occlusion suspension is off (video keeps painting under a covered or minimized window) and DOM timers are not throttled in a non-front tab. This costs idle CPU/GPU — which is why it is opt-in per site. |
+| `appMode` | Treats the page as a native app — a live terminal or remote desktop where browser chrome is in the way. ⌃Tab and F12 reach the page instead of switching tabs or popping the inspector; the browser's right-click menu is suppressed so the page's own rules the click; two-finger back/forward swipes are off; and closing a tab or window, reloading, going home, or quitting asks first — every one of them ends the session the moment the page unloads. |
+
+Keys are host patterns: an exact hostname, or one `*` standing for any run of characters — `ssh*.haiho.net` covers every SSH box under that domain now and later. An exact host beats a pattern; a file entry beats the built-in table. On launch the app also preconnects to every literal host listed, so the first navigation skips the DNS+TCP+TLS handshake.
+
+The same Settings window lists the zoom level each site remembered and clears it back to 100%, and toggles the AI button and profile chip in the corner. It also pins new windows to the primary display — the remembered window frame keeps the screen too, which otherwise reopens windows on whichever monitor they left.
+
 ## Ad blocking
 
 On by default, using WebKit's own content-blocker engine — the same mechanism
@@ -105,14 +310,20 @@ Chromeless ships a small built-in list and subscribes to **EasyList**,
 **EasyPrivacy**, and **ABPVN** on first launch, refreshing them weekly. Together
 they compile to about 114,000 rules. **View → Ad Blocking…** manages
 subscriptions, adds your own list URLs, edits your own filter rules, and lists
-the sites you turned blocking off for.
+the sites blocking is off for — added there by domain or toggled with ⇧⌘B.
 
 - `⇧⌘B` toggles blocking for the site you are on. Some sites do break without
   their ad frames; this is the escape hatch.
-- `⌃⇧⌘E` starts the element picker: hover to highlight, `↑`/`↓` to grow or
-  shrink the selection, click to hide it for good, `esc` to cancel. The rule is
-  saved as `domain##selector` in your own rules. Picked elements are hidden, not
-  blocked — the bytes still arrive.
+- `⌃⇧⌘E` starts the element picker: hover to highlight, click to select, then
+  the panel's `−`/`+` shrink or grow the selection through everything stacked
+  under the pointer — covered elements, ad overlays, ancestors. **Preview**
+  shows the page with it already hidden, and **Hide**
+  hides it on the spot — no reload, the saved rule covers the next visit.
+  **Cancel** goes back to picking, `↑`/`↓` still nudge the size, `esc` quits.
+  The rule is saved as `domain##selector` in your own rules; older rules the
+  new pick covers entirely are dropped, and a pick already covered by an
+  existing rule adds nothing. Picked elements are hidden, not blocked — the
+  bytes still arrive.
 - Rules use AdBlock Plus syntax, so any list in that format can be added.
 
 Settings live in `~/Library/Application Support/Chromeless/AdBlock/`, shared by
@@ -141,6 +352,8 @@ usage: chromeless [url] [options]
   --restore         reopen the selected profile's last saved page
   --profile <name>  use a specific profile
   --profiles        list profiles and exit
+  --private         open a private window (nothing is saved)
+  --remote          listen on the control socket so tools can drive the browser
   --adblock-selftest    check the filter converter and exit
   --adblock-compiletest convert every installed list and compile it for real
 ```
@@ -162,10 +375,57 @@ Chromeless doubles as a webpage-to-PNG tool:
 
 It loads the page, waits for it to settle, writes a Retina PNG, and exits.
 
+## Remote control
+
+**View ▸ Remote Control…** opens a window with one switch: *listen for
+commands on the control socket*. It is off by default. On — or launched with
+`--remote` — and anything running as you can drive the browser through a unix
+socket at
+
+```text
+~/Library/Application Support/Chromeless/control.sock
+```
+
+The wire is one JSON object per line each way: send `{"cmd":"windows"}`, get
+back every window and tab with indexes for targeting — and an `agent` flag on
+each. `open` and `navigate` take the same bare-domain-or-search input as `⌘L`;
+`eval` runs JavaScript and awaits promises; `snap` writes a PNG or returns it
+base64; `logs` reads the AI tab's console, page errors, and fetch/XHR calls;
+`back`, `forward`, `reload`, `stop`, `activate`, and `close` do what they say.
+The full command list is the header comment of `RemoteControl.swift`.
+
+The sandbox the app enforces, not just suggests: every command runs inside
+**AI tabs** — tabs the socket itself opened, marked orange with an `AI` pill
+in the tab bar, an orange border, and an orange rail at the top of the page.
+Your own tabs refuse commands outright. AI tabs always open in the
+background, popups they spawn stay AI tabs, and nothing remote ever takes
+your foreground — you keep browsing while the agent works alongside you.
+With more than one profile, the first `open` answers `needProfile` with the
+profile list — the agent asks you in chat and resends with `"profile"`, and
+its tabs only ever join that profile — a new window ordered front but never
+key appears for it when none carries it — until the socket is switched off.
+
+Two clients ship in `tools/`: `chromelessctl.py`, a dependency-free CLI that
+adds human actions on top (`click`, `type`, `press`, `wait`, `text`, `html`),
+and `chromeless-mcp.py`, a stdio MCP server that exposes the same surface as
+seventeen tools — screenshots come back as `image/png`, so a vision-capable
+agent can look at the page, not just read its DOM. The settings window's
+**Copy Setup Info** puts the socket path, protocol, and a ready-made MCP
+config on the pasteboard, sized for pasting straight into a chat with your
+agent.
+
+A unix socket rather than a TCP port on purpose: the file's `0600` mode is
+the whole permission model — nothing outside your account can connect — and
+an ad-hoc build never trips the incoming-connections prompt a TCP listener
+raises on every rebuild. Clicks and keystrokes are dispatched as real DOM
+events, which sites can in principle tell apart from a finger; pages that
+actively hunt automation are the only ones that will. And the honest
+warning, same as the keys file: on means *tools can act as you* — your tabs
+are off-limits to them, but every logged-in session is still one `open` away.
+
 ## Notes
 
 - Cookies, cache, local storage, and login sessions persist per profile on macOS 14+.
-- Downloads use the current window's profile session, so authenticated downloads work with the account logged in there.
 - `--snap` also accepts `--profile`, which is useful for authenticated dashboards.
 
 ## Passkeys

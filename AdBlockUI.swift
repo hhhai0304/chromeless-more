@@ -9,13 +9,24 @@ import WebKit
 
 // MARK: - Element picker
 
-// Injected on demand into the active tab. It draws its own highlight, walks the
-// DOM with the arrow keys, and hands the chosen selector back over a message
+// Injected on demand into the active tab. It draws its own highlight, and a
+// click docks a small panel that grows or shrinks the selection through the
+// stacking order before Hide hands the chosen selector back over a message
 // handler. Only the main frame is reachable, so an ad inside an iframe cannot be
 // picked — the frame itself can.
 let adBlockPickerScript = #"""
 (function () {
   if (window.__chromelessPicker) { window.__chromelessPicker.stop(); return; }
+
+  // A transparent shield swallows every pointer event before the page — or an
+  // ad iframe inside it — can act on the click; sites that navigate on
+  // mousedown or a click-capture registered before ours cannot steal the
+  // pick. Hit-testing then has to skip it, so the picker walks the full
+  // elementsFromPoint stack: [0] is what the pointer sees, deeper entries are
+  // whatever is covered — the elements an overlay hides, then the ancestors.
+  var shield = document.createElement('div');
+  shield.style.cssText = 'position:fixed;z-index:2147483646;left:0;top:0;' +
+    'right:0;bottom:0;cursor:crosshair;';
 
   var box = document.createElement('div');
   box.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;' +
@@ -27,12 +38,92 @@ let adBlockPickerScript = #"""
     'background:rgba(20,20,26,.94);color:#f2f2f7;border-radius:9px;padding:9px 14px;' +
     'font:12px/1.45 -apple-system,system-ui,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.45);' +
     'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+
+  // The confirm panel docks at the bottom, clear of whatever the highlight is
+  // covering, and keeps pointer events so its buttons can be clicked — the
+  // document-level handlers below bail out for anything inside it. Its width is
+  // fixed so the buttons never move when the selector above them changes
+  // length; the selector itself truncates and shows in full on hover.
+  var panel = document.createElement('div');
+  panel.style.cssText = 'position:fixed;z-index:2147483647;left:50%;bottom:20px;' +
+    'transform:translateX(-50%);display:none;flex-direction:column;gap:8px;' +
+    'width:380px;background:rgba(20,20,26,.96);color:#f2f2f7;' +
+    'border-radius:10px;padding:10px 12px;' +
+    'font:12px/1.45 -apple-system,system-ui,sans-serif;' +
+    'box-shadow:0 8px 28px rgba(0,0,0,.5);';
+
+  function panelButton(text, title) {
+    var b = document.createElement('button');
+    b.textContent = text;
+    b.title = title;
+    b.style.cssText = 'border:0;border-radius:6px;padding:5px 11px;cursor:pointer;' +
+      'font:12px -apple-system,system-ui,sans-serif;' +
+      'background:rgba(255,255,255,.15);color:#f2f2f7;';
+    return b;
+  }
+  var selLabel = document.createElement('span');
+  selLabel.style.cssText = 'display:block;overflow:hidden;white-space:nowrap;' +
+    'text-overflow:ellipsis;opacity:.85;';
+  var shrinkBtn = panelButton('−', 'Shrink the selection');
+  var growBtn = panelButton('+', 'Grow the selection');
+  var previewBtn = panelButton('Preview', 'See the page with this element hidden');
+  var spacer = document.createElement('span');
+  spacer.style.flex = '1';
+  var cancelBtn = panelButton('Cancel', 'Back to picking');
+  var hideBtn = panelButton('Hide', 'Hide this element for good');
+  hideBtn.style.background = '#408cff';
+  var btnRow = document.createElement('div');
+  btnRow.style.cssText = 'display:flex;align-items:center;gap:8px;';
+  btnRow.appendChild(shrinkBtn);
+  btnRow.appendChild(growBtn);
+  btnRow.appendChild(previewBtn);
+  btnRow.appendChild(spacer);
+  btnRow.appendChild(cancelBtn);
+  btnRow.appendChild(hideBtn);
+  panel.appendChild(selLabel);
+  panel.appendChild(btnRow);
+
+  document.documentElement.appendChild(shield);
   document.documentElement.appendChild(box);
   document.documentElement.appendChild(hint);
+  document.documentElement.appendChild(panel);
 
   var target = null;
-  var lifted = 0;   // how many levels up from the element under the pointer
-  var hovered = null;
+  // The last hit-test: every element under the pointer, ours filtered out.
+  // `depth` is the size dial — 0 is what is actually under the cursor, each +
+  // steps outward to whatever is stacked beneath it (its container, the
+  // overlay covering it, the ancestors).
+  var stack = [];
+  var depth = 0;
+  var confirming = false;
+  // Preview hides the current target with inline display:none, the same thing
+  // the compiled rule will do — and keeps enough to put the element's own
+  // inline style back, so a page that set one by hand survives the round trip.
+  var previewEl = null, previewDisplay = '', previewPriority = '';
+  // Where the previewed element was before it vanished — drawn as a dashed
+  // outline so ± steps during preview still show which region is gone.
+  var previewRect = null;
+
+  function applyPreview() {
+    if (!target || previewEl === target) return;
+    clearPreview();
+    previewEl = target;
+    previewRect = target.getBoundingClientRect();
+    previewDisplay = target.style.getPropertyValue('display');
+    previewPriority = target.style.getPropertyPriority('display');
+    target.style.setProperty('display', 'none', 'important');
+  }
+
+  function clearPreview() {
+    if (!previewEl) return;
+    if (previewDisplay) {
+      previewEl.style.setProperty('display', previewDisplay, previewPriority);
+    } else {
+      previewEl.style.removeProperty('display');
+    }
+    previewEl = null;
+    previewRect = null;
+  }
 
   function stableClass(c) {
     if (!c || c.length > 40) return false;
@@ -77,66 +168,212 @@ let adBlockPickerScript = #"""
     return parts.join(' > ');
   }
 
-  function resolve() {
-    var node = hovered;
-    for (var i = 0; i < lifted && node && node.parentElement; i++) {
-      if (node.parentElement.tagName === 'BODY') break;
-      node = node.parentElement;
-    }
-    return node;
+  function ours(e) {
+    return e === shield || e === box || e === hint || panel.contains(e);
+  }
+
+  // Everything the pointer is over, topmost first, minus the picker's own
+  // chrome — the shield is pointer-events:auto so it always tops the raw list.
+  function restack(x, y) {
+    var all = document.elementsFromPoint(x, y);
+    var s = [];
+    for (var i = 0; i < all.length; i++) if (!ours(all[i])) s.push(all[i]);
+    return s;
+  }
+
+  function resolve() { return stack[depth] || null; }
+
+  // Growing stops under BODY — hiding the whole page is never the intent.
+  function canGrow() {
+    var next = stack[depth + 1];
+    return !!next && next.tagName !== 'BODY' && next.tagName !== 'HTML';
   }
 
   function paint() {
     target = resolve();
     if (!target) { box.style.display = 'none'; return; }
+    // Preview follows the selection: growing or re-picking while previewing
+    // hides the new element and puts the old one back.
+    if (previewEl) applyPreview();
+    var sel = selectorFor(target);
+    selLabel.textContent = sel;
+    selLabel.title = sel;
+    shrinkBtn.style.opacity = depth > 0 ? '1' : '.35';
+    growBtn.style.opacity = canGrow() ? '1' : '.35';
+    if (previewEl) {
+      // The element itself is display:none, so its live rect is zero — the
+      // dashed outline sits where it was, marking the hole the rule will leave.
+      if (previewRect) {
+        var pr = previewRect;
+        box.style.display = 'block';
+        box.style.background = 'transparent';
+        box.style.borderStyle = 'dashed';
+        box.style.left = pr.left + 'px';
+        box.style.top = pr.top + 'px';
+        box.style.width = Math.max(0, pr.width - 2) + 'px';
+        box.style.height = Math.max(0, pr.height - 2) + 'px';
+      } else {
+        box.style.display = 'none';
+      }
+      hint.textContent = 'Previewing ' + sel + ' — Hide keeps it gone';
+      return;
+    }
+    box.style.background = 'rgba(64,140,255,.22)';
+    box.style.borderStyle = 'solid';
     var r = target.getBoundingClientRect();
     box.style.display = 'block';
     box.style.left = r.left + 'px';
     box.style.top = r.top + 'px';
     box.style.width = Math.max(0, r.width - 2) + 'px';
     box.style.height = Math.max(0, r.height - 2) + 'px';
-    hint.textContent = selectorFor(target) + '   —   click to hide, ↑ ↓ resize, esc to cancel';
+    hint.textContent = confirming
+      ? 'Adjust the size, preview, then Hide — esc quits'
+      : sel + '   —   click to select, esc to cancel';
+  }
+
+  function commit() {
+    if (!target) { stop(); return; }
+    var selector = selectorFor(target);
+    if (!selector) { stop(); return; }
+    // Clearing a live preview first means the values captured below are the
+    // page's own inline display, not ours.
+    clearPreview();
+    // Hide the element now: rebuilding the rule list takes a moment, and the
+    // element staying gone is the feedback that the click landed. The saved
+    // rule covers the next load, so the page is never reloaded — if nothing
+    // ends up saved the app calls back and the element is restored.
+    var hidden = target;
+    var origDisplay = hidden.style.getPropertyValue('display');
+    var origPriority = hidden.style.getPropertyPriority('display');
+    hidden.style.setProperty('display', 'none', 'important');
+    window.__chromelessPickDone = function (restore) {
+      if (restore) {
+        if (origDisplay) {
+          hidden.style.setProperty('display', origDisplay, origPriority);
+        } else {
+          hidden.style.removeProperty('display');
+        }
+      }
+      window.__chromelessPickDone = null;
+    };
+    document.removeEventListener('mousemove', onMove, true);
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('keydown', onKey, true);
+    removeSwallows();
+    if (shield.parentNode) shield.parentNode.removeChild(shield);
+    if (box.parentNode) box.parentNode.removeChild(box);
+    if (hint.parentNode) hint.parentNode.removeChild(hint);
+    if (panel.parentNode) panel.parentNode.removeChild(panel);
+    window.__chromelessPicker = null;
+    window.webkit.messageHandlers.chromelessPicker.postMessage(
+      JSON.stringify({ selector: selector, host: location.hostname }));
   }
 
   function onMove(e) {
-    var node = document.elementFromPoint(e.clientX, e.clientY);
-    if (!node || node === box || node === hint) return;
-    if (node !== hovered) { hovered = node; lifted = 0; }
+    // While the panel is up the selection is frozen: the pointer has to cross
+    // other elements on its way to the buttons, and it must not drag the
+    // highlight along with it.
+    if (confirming) return;
+    var s = restack(e.clientX, e.clientY);
+    if (s[0] !== stack[0]) depth = 0;
+    stack = s;
     paint();
   }
 
   function onClick(e) {
+    if (panel.contains(e.target)) return;
     e.preventDefault();
     e.stopPropagation();
+    // A click on the page while the panel is up re-picks what is under it.
+    var s = restack(e.clientX, e.clientY);
+    if (s[0] !== stack[0]) depth = 0;
+    stack = s;
+    target = resolve();
     if (!target) { stop(); return; }
-    var selector = selectorFor(target);
-    stop();
-    if (selector) {
-      window.webkit.messageHandlers.chromelessPicker.postMessage(
-        JSON.stringify({ selector: selector, host: location.hostname }));
-    }
+    confirming = true;
+    panel.style.display = 'flex';
+    paint();
   }
 
   function onKey(e) {
     if (e.key === 'Escape') { e.preventDefault(); stop(); return; }
-    if (e.key === 'ArrowUp') { e.preventDefault(); lifted++; paint(); return; }
-    if (e.key === 'ArrowDown') { e.preventDefault(); if (lifted > 0) lifted--; paint(); }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (canGrow()) depth++;
+      paint();
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (depth > 0) depth--;
+      paint();
+      return;
+    }
+    if (confirming && e.key === 'Enter') { e.preventDefault(); commit(); }
+  }
+
+  shrinkBtn.addEventListener('click', function () {
+    if (depth > 0) depth--;
+    paint();
+  });
+  growBtn.addEventListener('click', function () {
+    if (canGrow()) depth++;
+    paint();
+  });
+  previewBtn.addEventListener('click', function () {
+    if (previewEl) clearPreview(); else applyPreview();
+    previewBtn.style.background = previewEl
+      ? '#408cff' : 'rgba(255,255,255,.15)';
+    paint();
+  });
+  hideBtn.addEventListener('click', commit);
+  cancelBtn.addEventListener('click', function () {
+    clearPreview();
+    previewBtn.style.background = 'rgba(255,255,255,.15)';
+    confirming = false;
+    panel.style.display = 'none';
+    paint();
+  });
+
+  function swallow(e) { e.preventDefault(); e.stopPropagation(); }
+
+  // Captured on window so they run ahead of any document-level ad handler —
+  // ad networks like to navigate on mousedown or pointerdown, and a listener
+  // registered here before theirs still beats every target/bubble path. The
+  // shield already retargets the events; this keeps the browser's own
+  // defaults (text selection, context menus) quiet too.
+  var swallowTypes = ['mousedown', 'mouseup', 'pointerdown', 'pointerup',
+    'auxclick', 'contextmenu'];
+  function addSwallows() {
+    for (var i = 0; i < swallowTypes.length; i++) {
+      window.addEventListener(swallowTypes[i], swallow, true);
+    }
+  }
+  function removeSwallows() {
+    for (var i = 0; i < swallowTypes.length; i++) {
+      window.removeEventListener(swallowTypes[i], swallow, true);
+    }
   }
 
   function stop() {
+    clearPreview();
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKey, true);
+    removeSwallows();
+    if (shield.parentNode) shield.parentNode.removeChild(shield);
     if (box.parentNode) box.parentNode.removeChild(box);
     if (hint.parentNode) hint.parentNode.removeChild(hint);
+    if (panel.parentNode) panel.parentNode.removeChild(panel);
     window.__chromelessPicker = null;
   }
 
   document.addEventListener('mousemove', onMove, true);
   document.addEventListener('click', onClick, true);
   document.addEventListener('keydown', onKey, true);
+  addSwallows();
   window.__chromelessPicker = { stop: stop };
-  hint.textContent = 'Move over the element you want to hide — click to confirm, esc to cancel';
+  hint.textContent = 'Move over the element you want to hide — click to select, esc to cancel';
 })();
 """#
 
@@ -148,20 +385,77 @@ final class AdBlockPickerRouter: NSObject, WKScriptMessageHandler {
 
     func userContentController(_ controller: WKUserContentController,
                                didReceive message: WKScriptMessage) {
-        guard let webView = message.webView as? BrowserWebView,
-              let body = message.body as? String,
+        // The picker hides the element before this message arrives, so every
+        // rejection has to reach `onPickedSelector(nil)` — that is what puts
+        // the element back. Only a malformed message with no usable web view
+        // can be dropped silently, and it is not the picker's anyway.
+        guard let webView = message.webView as? BrowserWebView else { return }
+        guard let body = message.body as? String,
               let data = body.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: String],
               let selector = payload["selector"], !selector.isEmpty,
-              let host = payload["host"],
-              let domain = registrableDomain(for: host)
-        else { return }
-        guard FilterCompiler.isSafeSelector(selector) else {
+              // The rule's domain comes from the page that is loaded, not from the
+              // message: a rule for someone else's site is not the picker's to ask
+              // for, and it is the whole prize if this handler is ever reachable.
+              let host = webView.url?.host ?? payload["host"],
+              let domain = registrableDomain(for: host),
+              FilterCompiler.isSafeSelector(selector)
+        else {
             webView.onPickedSelector?(nil)
             return
         }
-        adBlockManager.appendCustomRule("\(domain)##\(selector)") {
-            webView.onPickedSelector?(selector)
+        let ruleLine = "\(domain)##\(selector)"
+        let prefix = "\(domain)##"
+        let siblings = adBlockManager.settings.customRules
+            .split(separator: "\n").map(String.init)
+            .compactMap { $0.hasPrefix(prefix) ? String($0.dropFirst(prefix.count)) : nil }
+        guard let argsData = try? JSONSerialization.data(
+                withJSONObject: ["n": selector, "o": siblings]),
+              let args = String(data: argsData, encoding: .utf8)
+        else {
+            adBlockManager.appendCustomRule(ruleLine) { webView.onPickedSelector?(selector) }
+            return
+        }
+        // Ask the live page which of the domain's stored rules the new pick
+        // swallows — a rule whose every match sits inside the new target is
+        // dead weight — and whether a stored rule already covers the pick
+        // (then adding it would only duplicate what stays hidden anyway).
+        // Failing the probe falls back to a plain append, which is safe.
+        let probe = """
+        (function (a) {
+          var out = { drop: [], covered: false }, news, i;
+          try { news = document.querySelectorAll(a.n); } catch (e) { return JSON.stringify(out); }
+          if (!news.length) return JSON.stringify(out);
+          news = Array.prototype.slice.call(news);
+          var rest = [];
+          for (i = 0; i < a.o.length; i++) {
+            var els;
+            try { els = Array.prototype.slice.call(document.querySelectorAll(a.o[i])); }
+            catch (e) { continue; }
+            if (!els.length) continue;
+            var inside = els.every(function (el) {
+              return news.some(function (n) { return n === el || n.contains(el); });
+            });
+            if (inside) { out.drop.push(a.o[i]); continue; }
+            rest = rest.concat(els);
+          }
+          out.covered = news.every(function (n) {
+            return rest.some(function (el) { return el === n || el.contains(n); });
+          });
+          return JSON.stringify(out);
+        })(\(args))
+        """
+        webView.evaluateJavaScript(probe, in: nil, in: chromelessWorld) { res in
+            var absorbed = Set<String>()
+            var covered = false
+            if let json = (try? res.get()) as? String, let data = json.data(using: .utf8),
+               let out = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                absorbed = Set((out["drop"] as? [String] ?? []).map { "\(prefix)\($0)" })
+                covered = out["covered"] as? Bool ?? false
+            }
+            adBlockManager.appendCustomRule(covered ? "" : ruleLine, absorbing: absorbed) {
+                webView.onPickedSelector?(selector)
+            }
         }
     }
 }
@@ -296,12 +590,15 @@ final class AdBlockSettingsWindowController: NSWindowController, NSWindowDelegat
         content.addSubview(allowScroll)
 
         y -= 32
+        let addSite = button("Add Site…", #selector(addSite))
+        addSite.frame = NSRect(x: margin, y: y, width: 100, height: 24)
+        content.addSubview(addSite)
         removeSiteButton.title = "Block Ads Here Again"
         removeSiteButton.bezelStyle = .rounded
         removeSiteButton.font = .systemFont(ofSize: 12)
         removeSiteButton.target = self
         removeSiteButton.action = #selector(removeSite)
-        removeSiteButton.frame = NSRect(x: margin, y: y, width: 180, height: 24)
+        removeSiteButton.frame = NSRect(x: margin + 108, y: y, width: 180, height: 24)
         content.addSubview(removeSiteButton)
 
         y -= 30
@@ -403,6 +700,37 @@ final class AdBlockSettingsWindowController: NSWindowController, NSWindowDelegat
         let row = allowTable.selectedRow
         guard allowlist.indices.contains(row) else { return }
         adBlockManager.removeFromAllowlist(allowlist[row])
+    }
+
+    @objc private func addSite() {
+        let alert = NSAlert()
+        alert.messageText = "Turn Blocking Off for a Site"
+        alert.informativeText = "Type a domain or paste a page URL."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 22))
+        field.placeholderString = "example.com"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let domain = adBlockManager.addToAllowlist(field.stringValue) else {
+            let failure = NSAlert()
+            failure.messageText = "That Doesn’t Look Like a Site"
+            failure.informativeText = "Type a domain like “example.com”, or paste a full URL."
+            failure.addButton(withTitle: "OK")
+            failure.runModal()
+            return
+        }
+        if let row = allowlist.firstIndex(of: domain) {
+            // The change notification reloads the table on the next pass through
+            // the run loop, so the selection has to wait for it.
+            DispatchQueue.main.async { [weak self] in
+                self?.allowTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                self?.allowTable.scrollRowToVisible(row)
+            }
+        }
     }
 
     @objc private func toggleList(_ sender: NSButton) {

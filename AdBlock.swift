@@ -160,6 +160,21 @@ final class AdBlockManager {
         return true
     }
 
+    // Sites can also be typed straight into the settings window, where no loaded
+    // page supplies the domain. A full URL works — only its registrable domain
+    // is stored, which is exactly what ⇧⌘B puts here. Returns the stored domain,
+    // or nil when the input cannot name a site at all.
+    @discardableResult
+    func addToAllowlist(_ input: String) -> String? {
+        guard let domain = siteDomain(from: input) else { return nil }
+        if !settings.allowlist.contains(domain) {
+            settings.allowlist.append(domain)
+            saveSettings()
+            rebuild()
+        }
+        return domain
+    }
+
     func removeFromAllowlist(_ domain: String) {
         settings.allowlist.removeAll { $0 == domain }
         saveSettings()
@@ -180,15 +195,22 @@ final class AdBlockManager {
         rebuild { _ in completion?() }
     }
 
-    func appendCustomRule(_ line: String, completion: (() -> Void)? = nil) {
+    /// Appends `line`, dropping stored rules listed in `absorbed` — rules the
+    /// page proved redundant because every element they match sits inside the
+    /// element the new rule hides. An empty `line` still applies the drops.
+    /// A no-op result skips the rebuild.
+    func appendCustomRule(_ line: String, absorbing absorbed: Set<String> = [],
+                          completion: (() -> Void)? = nil) {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { completion?(); return }
         var lines = settings.customRules.split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
-        lines.removeAll { $0.trimmingCharacters(in: .whitespaces).isEmpty }
-        guard !lines.contains(trimmed) else { completion?(); return }
-        lines.append(trimmed)
-        setCustomRules(lines.joined(separator: "\n"), completion: completion)
+        lines.removeAll {
+            $0.trimmingCharacters(in: .whitespaces).isEmpty || absorbed.contains($0)
+        }
+        if !trimmed.isEmpty && !lines.contains(trimmed) { lines.append(trimmed) }
+        let updated = lines.joined(separator: "\n")
+        guard updated != settings.customRules else { completion?(); return }
+        setCustomRules(updated, completion: completion)
     }
 
     // MARK: Subscriptions
@@ -577,6 +599,10 @@ final class AdBlockManager {
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             encoder.dateEncodingStrategy = .iso8601
             try encoder.encode(settings).write(to: settingsURL, options: .atomic)
+            // The allowlist names sites the user visits often enough to allow ads
+            // on; that is browsing history with extra steps.
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: settingsURL.path)
         } catch {
             fputs("chromeless: could not save ad-block settings: \(error.localizedDescription)\n", stderr)
         }

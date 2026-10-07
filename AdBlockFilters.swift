@@ -587,6 +587,24 @@ func registrableDomain(for host: String) -> String? {
     return labels.suffix(2).joined(separator: ".")
 }
 
+// Accepts what a user would type to name a site — a bare domain, a host with
+// subdomains, or a full URL — and reduces it to the registrable domain that
+// allowlist entries, data records, and history matching all agree on. Returns
+// nil when the input cannot name a site at all.
+func siteDomain(from input: String) -> String? {
+    var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+    // A little filter-syntax tolerance: "||example.com^" means the domain.
+    if text.hasPrefix("||") { text.removeFirst(2) }
+    text = text.trimmingCharacters(in: CharacterSet(charactersIn: "^"))
+    let candidate = text.contains("://") ? text : "https://\(text)"
+    let host = URL(string: candidate)?.host ?? text
+    guard let domain = registrableDomain(for: host), !domain.isEmpty,
+          domain.rangeOfCharacter(
+              from: CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789.-").inverted
+          ) == nil else { return nil }
+    return domain
+}
+
 // MARK: - Built-in list
 
 // Deliberately conservative. Every rule here is one that blocks advertising or
