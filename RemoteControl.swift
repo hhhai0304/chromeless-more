@@ -13,7 +13,9 @@
 //
 //   {"cmd": "ping"}                                → {"ok": true, ...}
 //   {"cmd": "windows"}                             → windows and their tabs
+//   {"cmd": "profiles"}                            → profile list + the AI's pick
 //   {"cmd": "open", "url": "example.com"}          → new AI tab, background
+//       add "profile": "<id or name>" to choose the profile the AI runs under
 //   {"cmd": "navigate", "url": "...", "tab": 1}    → move an AI tab
 //   {"cmd": "eval", "js": "document.title"}        → {"ok": true, "value": ...}
 //   {"cmd": "snap", "path": "/tmp/x.png"}          or {"base64": true}
@@ -22,11 +24,18 @@
 //
 // "window" and "tab" are indexes into the `windows` listing; the default is
 // the key window and its active tab, and every reply repeats which pair
-// actually answered. Commands other than `ping`, `windows`, and `open` only
-// work on AI tabs — tabs the socket opened, marked orange — the user's own
-// tabs answer with an error instead. `eval` awaits returned promises, so an
-// async expression is fine. URLs go through the same smartURL as ⌘L, so a
-// bare domain or even a search phrase works.
+// actually answered. Commands other than `ping`, `windows`, `profiles`, and
+// `open` only work on AI tabs — tabs the socket opened, marked orange — the
+// user's own tabs answer with an error instead. `eval` awaits returned
+// promises, so an async expression is fine. URLs go through the same
+// smartURL as ⌘L, so a bare domain or even a search phrase works.
+//
+// Which profile the agent runs under is the user's pick, made over the
+// wire: with more than one profile the first `open` answers `needProfile`
+// plus the list, the client asks its user and resends with "profile"; a
+// single profile binds itself. The pick holds until the socket stops —
+// agent tabs only ever join that profile's windows, and `open` orders up a
+// new front-but-not-key window when none carries it.
 
 import Cocoa
 import WebKit
@@ -216,6 +225,11 @@ final class RemoteControlServer {
     private var clientFDs = Set<Int32>()
     private let fdLock = NSLock()
     private(set) var running = false
+    /// The profile the user handed this agent session — set when `open`
+    /// carries a valid "profile" (or binds the only one), cleared when the
+    /// socket stops so the next run asks again. Main thread only, like
+    /// everything it gates.
+    private var agentProfileID: String?
 
     func startIfEnabled() {
         guard RemoteControlPreference.isOn || launchOptions.remote else { return }
@@ -264,6 +278,7 @@ final class RemoteControlServer {
         fdLock.unlock()
         for fd in fds { shutdown(fd, SHUT_RDWR); close(fd) }
         unlink(RemoteControlServer.socketPath)
+        agentProfileID = nil
     }
 
     // MARK: Connections
@@ -354,7 +369,11 @@ final class RemoteControlServer {
                   "pid": ProcessInfo.processInfo.processIdentifier,
                   "socket": RemoteControlServer.socketPath])
         case "windows":
-            done(["ok": true, "windows": windowList()])
+            done(["ok": true, "windows": windowList(),
+                  "agentProfile": chosenAgentProfile()?.name ?? NSNull()])
+        case "profiles":
+            done(["ok": true, "profiles": profileList(),
+                  "agentProfile": chosenAgentProfile()?.name ?? NSNull()])
         case "open": openURL(req, done)
         case "navigate": navigate(req, done)
         case "eval": evalJS(req, done)
@@ -394,15 +413,67 @@ final class RemoteControlServer {
         return .ok(wc: wc, tab: tab, wi: wi, ti: ti)
     }
 
-    /// The window an agent tab should be born in, or an error string.
-    private func resolveWindow(_ req: [String: Any])
-        -> (wc: BrowserWindowController, wi: Int)? {
-        let controllers = (NSApp.delegate as? AppDelegate)?.controllers ?? []
-        guard !controllers.isEmpty else { return nil }
-        let wi = req["window"] as? Int
-            ?? controllers.firstIndex { $0.window?.isKeyWindow == true } ?? 0
-        guard controllers.indices.contains(wi) else { return nil }
-        return (controllers[wi], wi)
+    /// The stored pick — never prompts. Nil until an `open` sets it.
+    private func chosenAgentProfile() -> BrowserProfile? {
+        guard let id = agentProfileID else { return nil }
+        return profileStore.profiles.first { $0.id == id }
+    }
+
+    private func profileList() -> [[String: Any]] {
+        profileStore.profiles.map { [
+            "id": $0.id,
+            "name": $0.name,
+            "default": $0.id == profileStore.defaultProfileID,
+        ] }
+    }
+
+    /// The reply when `open` can't bind a profile itself: the client is
+    /// expected to ask its user which one and resend with "profile". That
+    /// question is deliberately the client's to ask — the person answering
+    /// is sitting in front of the chat UI, not a Chromeless panel.
+    private func needProfileReply(_ error: String) -> [String: Any] {
+        ["ok": false, "error": error, "needProfile": true,
+         "profiles": profileList(),
+         "hint": "ask the user which profile to use, then resend with \"profile\": \"<id or name>\""]
+    }
+
+    /// The profile this `open` runs under. The choice is the user's, relayed
+    /// by the client, and made once per server run: already bound, a
+    /// "profile" field naming it (or none) just proceeds, while naming
+    /// another is an error — the pick is not the client's to change. Not yet
+    /// bound, an explicit "profile" binds it; a single profile binds itself;
+    /// anything else answers `needProfile` so the user gets asked.
+    private func resolveAgentProfile(_ req: [String: Any]) -> BrowserProfile? {
+        let requested = (req["profile"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        if let bound = chosenAgentProfile() {
+            if let requested, profileStore.profile(matching: requested)?.id != bound.id {
+                return nil
+            }
+            return bound
+        }
+        agentProfileID = nil
+        if let requested {
+            guard let picked = profileStore.profile(matching: requested) else { return nil }
+            agentProfileID = picked.id
+            return picked
+        }
+        guard profileStore.profiles.count == 1, let only = profileStore.profiles.first
+        else { return nil }
+        agentProfileID = only.id
+        return only
+    }
+
+    /// Distinguishes "bound profile rejected the request" from "ask the
+    /// user" for the `open` reply.
+    private func agentProfileError(_ req: [String: Any]) -> [String: Any] {
+        if let bound = chosenAgentProfile() {
+            return ["ok": false, "error": "this session is bound to profile "
+                + "\"\(bound.name)\" — switch remote control off and on to change it"]
+        }
+        if let requested = req["profile"] as? String, !requested.isEmpty {
+            return needProfileReply("no profile \"\(requested)\"")
+        }
+        return needProfileReply("pick a profile for the AI to use")
     }
 
     private func windowList() -> [[String: Any]] {
@@ -430,22 +501,69 @@ final class RemoteControlServer {
     }
 
     /// `open` is the only way a tab becomes an agent tab — it always makes a
-    /// new one, always in the background, in whichever existing window it was
-    /// pointed at. It can never navigate one of the user's tabs and never
-    /// makes a window.
+    /// new one, always in the background, in a window carrying the profile
+    /// the user picked for this agent session. It can never navigate one of
+    /// the user's tabs. A `window` index pins it to that window — which must
+    /// be on the agent's profile — and without one a matching window is
+    /// found (the key one, then the first); when none exists a new window is
+    /// ordered up for it, front but not key, so the user's focus still isn't
+    /// taken. That birth is the one place remote control makes a window.
     private func openURL(_ req: [String: Any], _ done: ([String: Any]) -> Void) {
         guard let raw = req["url"] as? String, let url = smartURL(raw) else {
             done(["ok": false, "error": "open needs a \"url\" that parses"])
             return
         }
-        guard let (wc, wi) = resolveWindow(req) else {
-            done(["ok": false, "error": "no such window"])
+        guard let profile = resolveAgentProfile(req) else {
+            done(agentProfileError(req))
             return
         }
-        let tab = wc.addAgentTab(url: url)
-        let ti = wc.tabs.firstIndex { $0 === tab } ?? wc.tabs.count - 1
-        done(["ok": true, "window": wi, "tab": ti, "agent": true,
-              "foreground": false, "url": url.absoluteString])
+        guard let app = NSApp.delegate as? AppDelegate else {
+            done(["ok": false, "error": "no windows"])
+            return
+        }
+        let controllers = app.controllers
+        let eligible = { (wc: BrowserWindowController) in
+            !wc.isPrivate && wc.profileID == profile.id
+        }
+        if let requested = req["window"] as? Int {
+            guard controllers.indices.contains(requested) else {
+                done(["ok": false, "error": "no such window"])
+                return
+            }
+            guard eligible(controllers[requested]) else {
+                done(["ok": false, "error": "window \(requested) is not on "
+                    + "profile \"\(profile.name)\" — AI tabs only join the "
+                    + "profile the user picked"])
+                return
+            }
+            let tab = controllers[requested].addAgentTab(url: url)
+            let ti = controllers[requested].tabs.firstIndex { $0 === tab }
+                ?? controllers[requested].tabs.count - 1
+            done(["ok": true, "window": requested, "tab": ti, "agent": true,
+                  "foreground": false, "profile": profile.name,
+                  "url": url.absoluteString])
+            return
+        }
+        if let wi = controllers.firstIndex(where: {
+                $0.window?.isKeyWindow == true && eligible($0)
+            }) ?? controllers.firstIndex(where: eligible) {
+            let tab = controllers[wi].addAgentTab(url: url)
+            let ti = controllers[wi].tabs.firstIndex { $0 === tab }
+                ?? controllers[wi].tabs.count - 1
+            done(["ok": true, "window": wi, "tab": ti, "agent": true,
+                  "foreground": false, "profile": profile.name,
+                  "url": url.absoluteString])
+            return
+        }
+        // Nothing on the picked profile yet: the socket opens a window for
+        // it — the profile was already the user's yes — whose only tab is
+        // the agent's, ordered front but never key.
+        let wc = app.openWindow(profile: profile, url: url,
+                                foreground: false, firstTabAgent: true)
+        let wi = app.controllers.firstIndex { $0 === wc } ?? (app.controllers.count - 1)
+        done(["ok": true, "window": wi, "tab": 0, "agent": true,
+              "foreground": false, "profile": profile.name,
+              "windowCreated": true, "url": url.absoluteString])
     }
 
     private func navigate(_ req: [String: Any], _ done: ([String: Any]) -> Void) {

@@ -400,6 +400,10 @@ in the tab bar, an orange border, and an orange rail at the top of the page.
 Your own tabs refuse commands outright. AI tabs always open in the
 background, popups they spawn stay AI tabs, and nothing remote ever takes
 your foreground — you keep browsing while the agent works alongside you.
+With more than one profile, the first `open` answers `needProfile` with the
+profile list — the agent asks you in chat and resends with `"profile"`, and
+its tabs only ever join that profile — a new window ordered front but never
+key appears for it when none carries it — until the socket is switched off.
 
 Two clients ship in `tools/`: `chromelessctl.py`, a dependency-free CLI that
 adds human actions on top (`click`, `type`, `press`, `wait`, `text`, `html`),

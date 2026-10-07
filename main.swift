@@ -1657,11 +1657,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     private var aiChipWidth: CGFloat { AIButtonPreference.isOn ? 32 : 0 }
 
     init(profile: BrowserProfile, url: URL?, size: NSSize?, snap: SnapJob?,
-         isPrimary: Bool, isPrivate: Bool = false) {
+         isPrimary: Bool, isPrivate: Bool = false, firstTabAgent: Bool = false) {
         self.profile = profile
         self.isPrivate = isPrivate
-        tabs = [Tab(webView: BrowserWebView(
-            frame: .zero, configuration: makeWebConfiguration(for: profile, isPrivate: isPrivate)))]
+        // A window the control socket opens is born with its one agent tab —
+        // the remote `open` that caused it — rather than a start page that
+        // would only sit beside the tab it was asked for.
+        let firstConf = firstTabAgent
+            ? makeAgentConfiguration(for: profile, isPrivate: isPrivate)
+            : makeWebConfiguration(for: profile, isPrivate: isPrivate)
+        tabs = [Tab(webView: BrowserWebView(frame: .zero, configuration: firstConf))]
+        // Set before configure() so the orange border lands on the first paint.
+        tabs[0].isAgent = firstTabAgent
         snapJob = snap
 
         let contentSize = size ?? NSSize(width: 1160, height: 760)
@@ -4289,17 +4296,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
         }
     }
 
+    @discardableResult
     func openWindow(profile: BrowserProfile, url: URL?, size: NSSize? = nil,
-                    snap: SnapJob? = nil, isPrimary: Bool = false, isPrivate: Bool = false) {
+                    snap: SnapJob? = nil, isPrimary: Bool = false, isPrivate: Bool = false,
+                    foreground: Bool = true, firstTabAgent: Bool = false) -> BrowserWindowController {
         let controller = BrowserWindowController(
             profile: profile, url: url, size: size, snap: snap,
-            isPrimary: isPrimary, isPrivate: isPrivate)
+            isPrimary: isPrimary, isPrivate: isPrivate, firstTabAgent: firstTabAgent)
         controller.onClose = { [weak self, weak controller] in
             self?.controllers.removeAll { $0 === controller }
         }
         controllers.append(controller)
-        controller.showWindow(nil)
-        controller.window?.makeKeyAndOrderFront(nil)
+        if foreground {
+            controller.showWindow(nil)
+            controller.window?.makeKeyAndOrderFront(nil)
+        } else {
+            // Ordered front but never key: the window appears so the user can
+            // see what the agent got, without taking the focus it was using.
+            controller.window?.orderFront(nil)
+        }
         // Placement is only final once the window is ordered: the
         // WindowServer may still re-place a restored frame between init and
         // here (tiling state, space bookkeeping), so where it actually landed
@@ -4311,6 +4326,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSTableViewDataSource,
                 PrimaryScreenPreference.constrain(window)
             }
         }
+        return controller
     }
 
     @objc func newWindow(_ sender: Any?) { presentProfilePicker(from: nil) }

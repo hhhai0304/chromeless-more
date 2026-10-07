@@ -50,11 +50,21 @@ TOOLS = [
      "List every window and tab with its index, title, URL, active/loading state, "
      "and whether it is an AI tab you may command. Use the indexes to target "
      "other tools.", _props()),
+    ("chromeless_profiles",
+     "List the browser's profiles and which one this AI session is bound to. "
+     "When chromeless_open answers needProfile, ask the user which profile "
+     "the AI may use and retry with that profile.", _props()),
     ("chromeless_open",
      "Open a URL in a NEW AI tab — always in the background, never taking the "
      "user's foreground. Bare domains and search phrases work like the app's "
-     "own address bar. 'window' picks which window hosts the tab.",
-     _props(required=["url"], extra={"url": {"type": "string"}})),
+     "own address bar. 'window' picks which window hosts the tab. With more "
+     "than one profile the first call answers needProfile plus the profile "
+     "list: ask the user which profile the AI may use, then retry passing it "
+     "as 'profile' — the pick binds the session until remote control restarts.",
+     _props(required=["url"], extra={
+         "url": {"type": "string"},
+         "profile": {"type": "string",
+                     "description": "profile id or name the AI session should use"}})),
     ("chromeless_navigate", "Navigate an AI tab to a URL." + _RULES,
      _props(required=["url"], extra={"url": {"type": "string"}})),
     ("chromeless_evaluate",
@@ -131,8 +141,16 @@ def call_tool(name, args):
         return _text(json.dumps(ctl.request({"cmd": "ping"})))
     if name == "chromeless_windows":
         return _text(json.dumps(ctl.call("windows"), indent=2))
+    if name == "chromeless_profiles":
+        return _text(json.dumps(ctl.call("profiles"), indent=2))
     if name == "chromeless_open":
-        out = ctl.call("open", url=args["url"], window=args.get("window"))
+        # request() rather than call(): a needProfile reply carries the
+        # profile list the agent must show its user — not an error to raise.
+        out = ctl.request({"cmd": "open", "url": args["url"],
+                           "window": args.get("window"),
+                           "profile": args.get("profile")})
+        if not out.get("ok") and not out.get("needProfile"):
+            return _err(out.get("error", "open failed"))
         return _text(json.dumps(out))
     if name == "chromeless_navigate":
         return _text(json.dumps(ctl.call("navigate", url=args["url"], **tgt)))

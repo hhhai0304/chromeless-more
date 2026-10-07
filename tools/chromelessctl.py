@@ -11,7 +11,9 @@ orange in the tab bar with an "AI" pill. The user's own tabs answer with
 an error, and nothing here ever takes the user's foreground.
 
     chromelessctl.py windows
+    chromelessctl.py profiles                  # profile list + the AI's bound one
     chromelessctl.py open example.com          # new AI tab, background
+    chromelessctl.py open example.com --profile work
     chromelessctl.py eval 'document.title' --tab 1
     chromelessctl.py click 'button.buy' --tab 1
     chromelessctl.py type '#q' 'search terms' --clear --tab 1
@@ -207,9 +209,12 @@ def main(argv=None):
 
     sub.add_parser("ping")
     sub.add_parser("windows")
+    sub.add_parser("profiles", help="list profiles and the AI's bound one")
     o = sub.add_parser("open", parents=[target],
                        help="open a URL in a new AI tab (always background)")
     o.add_argument("url")
+    o.add_argument("--profile", default=None,
+                   help="profile id or name the AI session should use")
     n = sub.add_parser("nav", parents=[target], help="navigate an existing AI tab")
     n.add_argument("url")
     e = sub.add_parser("eval", parents=[target], help="evaluate JavaScript in a tab")
@@ -252,8 +257,17 @@ def main(argv=None):
             out = request({"cmd": "ping"}, args.socket)
         elif cmd == "windows":
             out = call("windows", args.socket)
+        elif cmd == "profiles":
+            out = call("profiles", args.socket)
         elif cmd == "open":
-            out = call("open", args.socket, url=args.url, **tgt)
+            # request() rather than call(): a needProfile reply is not an
+            # error to unwrap but the profile list to hand back.
+            payload = {"cmd": "open", "url": args.url,
+                       "profile": args.profile, **tgt}
+            out = request({k: v for k, v in payload.items() if v is not None},
+                          args.socket)
+            print(json.dumps(out, indent=2, ensure_ascii=False))
+            sys.exit(0 if out.get("ok") else 1)
         elif cmd == "nav":
             out = call("navigate", args.socket, url=args.url, **tgt)
         elif cmd == "eval":

@@ -66,16 +66,23 @@ final class RemoteSettingsWindowController: NSWindowController {
           • Every command runs inside AI tabs — tabs the socket itself opened,
             marked orange with an "AI" pill in the tab bar and an orange rail
             at the top of the page. The user's own tabs refuse commands.
+          • With more than one profile, the first "open" replies
+            needProfile plus the list — ask your user which one the AI
+            may use, then resend with "profile". The pick holds until
+            the socket is switched off.
           • AI tabs always open in the background; nothing remote ever takes
             the user's foreground or focus. The user keeps browsing normally.
-          • Windows are never created or closed remotely — tabs only.
+          • Windows are never closed remotely; "open" creates one only when
+            the AI's profile has none — front, but never key.
           • Popups (window.open) from an AI tab stay AI tabs, marked the same.
 
         Commands ("window"/"tab" index into the `windows` reply; URLs take
         bare domains or searches):
           {"cmd":"ping"}
-          {"cmd":"windows"}                            windows + tabs, "agent" flags
-          {"cmd":"open","url":"example.com"}           new AI tab, background
+          {"cmd":"windows"}                            windows + tabs, "agent" flags, AI profile
+          {"cmd":"profiles"}                           profile list + the AI's bound one
+          {"cmd":"open","url":"example.com"}           new AI tab, background — add
+            "profile":"<id or name>" to pick the profile the AI runs under
           {"cmd":"navigate","url":"…","tab":1}         move an AI tab
           {"cmd":"eval","js":"document.title"}         JS result; promises awaited
           {"cmd":"snap","path":"/tmp/p.png"}           or {"base64":true}

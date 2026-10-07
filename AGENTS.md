@@ -44,6 +44,10 @@ dependencies, no test suite. Built on WKWebView.
   `tools/chromeless-mcp.py` exposes the same as MCP tools over stdio.
 - Commands only reach **agent tabs** (`Tab.isAgent`) — tabs the socket
   opened, marked orange. The user's own tabs refuse them; `open` is the only
-  way a tab becomes one, always background. `logs` reads a tab's
-  console/errors/fetch/XHR feed (`AgentLog`, page-world probe on
-  `chromelessAgentLog`).
+  way a tab becomes one, always background. With multiple profiles the
+  first `open` of a server run answers `needProfile` + the profile list —
+  the client asks its user and resends with `"profile"` (a single profile
+  binds itself); agent tabs only join that profile, and `open` orders up a
+  non-key window for it when none exists. The pick resets when the socket
+  stops. `logs` reads a tab's console/errors/fetch/XHR feed (`AgentLog`,
+  page-world probe on `chromelessAgentLog`).
