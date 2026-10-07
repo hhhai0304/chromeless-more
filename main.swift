@@ -1012,7 +1012,7 @@ window.__clf = window.__clf || (function () {
 // without promising a WebKit feature the site might then call.
 private let chromeUserAgentString =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-    "(KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/155.0.8059.39 Safari/537.36"
 
 /// Where the scripts this app injects live, and where their message handlers are
 /// registered. A page cannot see `window.webkit.messageHandlers` entries from
@@ -3995,7 +3995,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
            let url = navigationAction.request.url,
            let host = url.host?.lowercased(),
            ["http", "https"].contains(url.scheme ?? "") {
-            let wantUA = tweaksForHost(host)?.chromeUserAgent == true ? chromeUserAgentString : nil
+            // Chrome UA is the global default — Google apps serve it their
+            // fast path (Sheets' Safari branch renders its grid canvas at
+            // half resolution). An explicit `chromeUserAgent: false` in site
+            // tweaks is the opt-out for hosts that want the real Safari UA.
+            let wantUA = tweaksForHost(host)?.chromeUserAgent == false ? nil : chromeUserAgentString
             // The getter reports "" for "no override" on newer WebKit, not nil —
             // comparing raw would restart every navigation forever.
             let haveUA = webView.customUserAgent?.isEmpty == false ? webView.customUserAgent : nil

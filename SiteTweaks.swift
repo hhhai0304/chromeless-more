@@ -12,9 +12,11 @@ struct SiteTweaks {
     /// active tab of a visible window — a remote session must not freeze
     /// because the local screen went dark.
     var keepAwake = false
-    /// Present a Chrome user agent. Some Google apps serve a faster path to
-    /// Chrome — or a Chrome-only one; if the site misbehaves, flip this off.
-    var chromeUserAgent = false
+    /// Present a Chrome user agent — the global default, since Google apps
+    /// serve Chrome a faster path (Sheets' Safari branch renders its grid
+    /// canvas at half resolution). Set false to keep the real Safari UA for
+    /// a site that misbehaves under the spoof.
+    var chromeUserAgent = true
     /// Keep the page fully alive in the background: no window-occlusion
     /// suspension (video keeps painting under a covered or minimized window)
     /// and no DOM timer throttling in a non-front tab. Costs idle CPU/GPU —
@@ -33,7 +35,7 @@ extension SiteTweaks: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         keepAwake = try c.decodeIfPresent(Bool.self, forKey: .keepAwake) ?? false
-        chromeUserAgent = try c.decodeIfPresent(Bool.self, forKey: .chromeUserAgent) ?? false
+        chromeUserAgent = try c.decodeIfPresent(Bool.self, forKey: .chromeUserAgent) ?? true
         backgroundWork = try c.decodeIfPresent(Bool.self, forKey: .backgroundWork) ?? false
         appMode = try c.decodeIfPresent(Bool.self, forKey: .appMode) ?? false
     }
@@ -105,7 +107,7 @@ private let siteTweaksReadme =
     "characters: ssh*.example.com covers ssh-a.example.com and ssh.example.com. An exact host " +
     "beats a pattern; an entry here beats the built-in table. Flags: keepAwake (no App Nap or " +
     "sleep while the site is visible), backgroundWork (no suspension or timer throttling while " +
-    "hidden), chromeUserAgent, appMode (the page owns the keyboard and the right-click; close, " +
+    "hidden), chromeUserAgent (on by default; false keeps the real Safari UA), appMode (the page owns the keyboard and the right-click; close, " +
     "reload and quit ask first — for live terminals and remote desktops)."
 
 // The `_readme` key decodes to an all-false entry under a name no host can
