@@ -1111,7 +1111,11 @@ func makeWebConfiguration(for profile: BrowserProfile, isPrivate: Bool = false) 
             })();
             """,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: false)
+            // Main frame only: the feature detect this serves is the site's own
+            // sign-in page. A third-party iframe — an SSO widget, Cloudflare's
+            // challenge — arrives expecting an untouched browser, and deleting
+            // globals under it is exactly the tampering those checks fail on.
+            forMainFrameOnly: true)
         conf.userContentController.addUserScript(hideWebAuthn)
     }
     return conf
