@@ -3995,11 +3995,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
            let url = navigationAction.request.url,
            let host = url.host?.lowercased(),
            ["http", "https"].contains(url.scheme ?? "") {
-            // Chrome UA is the global default — Google apps serve it their
-            // fast path (Sheets' Safari branch renders its grid canvas at
-            // half resolution). An explicit `chromeUserAgent: false` in site
-            // tweaks is the opt-out for hosts that want the real Safari UA.
-            let wantUA = tweaksForHost(host)?.chromeUserAgent == false ? nil : chromeUserAgentString
+            // A Chrome UA is opt-in per host: it is a claim the WebKit engine
+            // cannot back (Chrome also sends `Sec-CH-UA` client hints, and this
+            // app has no way to add them), so Cloudflare's challenge — which
+            // reads exactly that pair — refuses to clear a spoofed host. The
+            // default is the real Safari UA; see `SiteTweaks.chromeUserAgent`.
+            let wantUA = tweaksForHost(host)?.chromeUserAgent == true ? chromeUserAgentString : nil
             // The getter reports "" for "no override" on newer WebKit, not nil —
             // comparing raw would restart every navigation forever.
             let haveUA = webView.customUserAgent?.isEmpty == false ? webView.customUserAgent : nil

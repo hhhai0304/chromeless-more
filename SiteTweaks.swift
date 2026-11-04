@@ -12,11 +12,15 @@ struct SiteTweaks {
     /// active tab of a visible window — a remote session must not freeze
     /// because the local screen went dark.
     var keepAwake = false
-    /// Present a Chrome user agent — the global default, since Google apps
-    /// serve Chrome a faster path (Sheets' Safari branch renders its grid
-    /// canvas at half resolution). Set false to keep the real Safari UA for
-    /// a site that misbehaves under the spoof.
-    var chromeUserAgent = true
+    /// Present a Chrome user agent. Off by default: a UA is a claim the engine
+    /// has to back, and WebKit cannot — Chrome also sends `Sec-CH-UA` client
+    /// hints on every request, and this app has no way to add them, so a
+    /// spoofed Chrome UA reaches the server as "Chrome, with none of Chrome's
+    /// headers". Cloudflare's managed challenge reads exactly that pair and
+    /// never issues clearance: "verify you are human" fails on every pass,
+    /// on every site, until the real UA comes back. Opt in per host for the
+    /// Google apps whose Chrome branch is worth the lie.
+    var chromeUserAgent = false
     /// Keep the page fully alive in the background: no window-occlusion
     /// suspension (video keeps painting under a covered or minimized window)
     /// and no DOM timer throttling in a non-front tab. Costs idle CPU/GPU —
@@ -35,7 +39,7 @@ extension SiteTweaks: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         keepAwake = try c.decodeIfPresent(Bool.self, forKey: .keepAwake) ?? false
-        chromeUserAgent = try c.decodeIfPresent(Bool.self, forKey: .chromeUserAgent) ?? true
+        chromeUserAgent = try c.decodeIfPresent(Bool.self, forKey: .chromeUserAgent) ?? false
         backgroundWork = try c.decodeIfPresent(Bool.self, forKey: .backgroundWork) ?? false
         appMode = try c.decodeIfPresent(Bool.self, forKey: .appMode) ?? false
     }
@@ -46,6 +50,11 @@ extension SiteTweaks: Codable {
 let siteTweaks: [String: SiteTweaks] = [
     "remotedesktop.google.com": SiteTweaks(
         keepAwake: true, chromeUserAgent: true, backgroundWork: true, appMode: true),
+    // The one place the spoof pays for itself: Sheets builds its grid canvas at
+    // full device resolution on the Chrome branch and at half on the Safari
+    // one, which smudges every cell. Drive serves the same canvases.
+    "docs.google.com": SiteTweaks(chromeUserAgent: true),
+    "drive.google.com": SiteTweaks(chromeUserAgent: true),
 ]
 
 let siteTweaksFileURL: URL = {
@@ -107,7 +116,9 @@ private let siteTweaksReadme =
     "characters: ssh*.example.com covers ssh-a.example.com and ssh.example.com. An exact host " +
     "beats a pattern; an entry here beats the built-in table. Flags: keepAwake (no App Nap or " +
     "sleep while the site is visible), backgroundWork (no suspension or timer throttling while " +
-    "hidden), chromeUserAgent (on by default; false keeps the real Safari UA), appMode (the page owns the keyboard and the right-click; close, " +
+    "hidden), chromeUserAgent (a Chrome UA to a WebKit engine is a claim the engine cannot " +
+    "back — Cloudflare's challenge rejects it — so it is off unless a host needs it), " +
+    "appMode (the page owns the keyboard and the right-click; close, " +
     "reload and quit ask first — for live terminals and remote desktops)."
 
 // The `_readme` key decodes to an all-false entry under a name no host can
