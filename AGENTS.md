@@ -23,9 +23,9 @@ dependencies, no test suite. Built on WKWebView.
   menus, HUD (`⌘L`), find-in-page, downloads panel, permissions, snapshots.
 - Feature areas split out alongside it: `AI.swift`/`AIUI.swift` (sidebar +
   settings), `AdBlock.swift`/`AdBlockFilters.swift`/`AdBlockUI.swift`,
-  `Downloads.swift`, `QuickAccess.swift`, `SiteTweaks.swift`,
-  `SettingsUI.swift`, `Translate.swift`,
-  `RemoteControl.swift`/`RemoteUI.swift`.
+  `Downloads.swift`, `QuickAccess.swift`, `SiteTweaks.swift`, `SettingsUI.swift`,
+  `Translate.swift`, `RemoteControl.swift`/`RemoteUI.swift`, `Security.swift`
+  (certificate audit, cleartext refusal, capture guard).
 - `tools/` holds standalone helpers, not app code.
 - State files live in `~/Library/Application Support/Chromeless/` and stay
   owner-only (`0600`) — keep that convention.

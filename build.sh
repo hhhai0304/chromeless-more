@@ -20,6 +20,7 @@ swiftc -O -swift-version 5 \
   -target "$ARCH-apple-macos13.0" \
   main.swift Downloads.swift AdBlock.swift AdBlockFilters.swift AdBlockUI.swift QuickAccess.swift \
   AI.swift AIUI.swift SiteTweaks.swift SettingsUI.swift Translate.swift RemoteControl.swift RemoteUI.swift \
+  Security.swift \
   -o "$APP/Contents/MacOS/Chromeless" \
   -framework Cocoa -framework WebKit -framework NaturalLanguage
 

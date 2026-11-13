@@ -1067,6 +1067,9 @@ func makeWebConfiguration(for profile: BrowserProfile, isPrivate: Bool = false) 
     }
     conf.mediaTypesRequiringUserActionForPlayback = []
     conf.allowsAirPlayForMediaPlayback = true
+    // WebKit's malware and phishing lookup. Safari ships it on; an embedded
+    // view is not guaranteed to, and this app has no switch to turn it back on.
+    conf.preferences.isFraudulentWebsiteWarningEnabled = true
     conf.applicationNameForUserAgent = "Version/26.0 Safari/605.1.15"
     // SSO sign-ins often reach window.open only after an async hop — fetch the
     // IdP URL, then open it — by which point WebKit no longer counts the click
@@ -1643,6 +1646,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
     // download arrives a round trip later, by which time the key is released.
     private var pendingDownloadWantsPanel = false
     private var isConfirmingExternalOpen = false
+    // One sheet at a time for a page that would be fetched in the clear, plus a
+    // per-session memory of the hosts the user cleared: an intranet app that
+    // only speaks http must not ask again on every click.
+    private var isConfirmingInsecureLoad = false
+    private var insecureAllowedHosts: Set<String> = []
+    // Certificate warnings already spoken, one per host per window.
+    private var announcedCertHosts: Set<String> = []
     var profileID: String { profile.id }
     var onClose: (() -> Void)?
 
@@ -1694,6 +1704,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         window.collectionBehavior.insert(.fullScreenPrimary)
         window.acceptsMouseMovedEvents = true
         window.delegate = self
+        // Per-window captures come back empty; see CaptureGuard for what this
+        // does and does not stop.
+        CaptureGuard.apply(to: window)
         setTrafficLights(visible: false)
 
         let container = LayoutReportingView(frame: NSRect(origin: .zero, size: contentSize))
@@ -2640,10 +2653,19 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func load(_ url: URL, in tab: Tab) {
         tab.onStartPage = false
-        if url.isFileURL {
-            tab.webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
+        // An address typed, picked from the tiles, or handed over by the control
+        // socket: nothing on screen is being taken away, so TLS is the only
+        // reasonable first attempt. A link is the other case — the page named an
+        // unencrypted URL and the user is the one who has to agree to it — which
+        // the navigation delegate asks about. `--snap` loads exactly what it was
+        // told to, because a screenshot tool that silently retargets is a bug.
+        let target = launchOptions.snap == nil
+            ? InsecureNavigation.upgradedToHTTPS(url)
+            : url
+        if target.isFileURL {
+            tab.webView.loadFileURL(target, allowingReadAccessTo: target.deletingLastPathComponent())
         } else {
-            tab.webView.load(URLRequest(url: url))
+            tab.webView.load(URLRequest(url: target))
         }
     }
 
@@ -3518,6 +3540,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.7, execute: work)
     }
 
+    /// Says out loud the one thing a tab title cannot: this page is certified by
+    /// something no public CA signed. One line, once per host, and never in
+    /// --snap — a toast in a screenshot is a lie about the page.
+    private func announceCertificate(for host: String?) {
+        guard launchOptions.snap == nil,
+              let host = host?.lowercased(),
+              !announcedCertHosts.contains(host),
+              let report = TLSAudit.report(for: host), report.unexpected else { return }
+        announcedCertHosts.insert(host)
+        showToast(report.selfSigned
+                  ? "\(host): self-signed certificate"
+                  : "\(host): certificate not from a public CA")
+    }
+
     // MARK: Snapshots
 
     private func writePNG(from image: NSImage, to path: String) -> (Int, Int)? {
@@ -3874,6 +3910,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
         guard let finished = tab(for: webView) else { return }
         tabBar.update(titleAt: tabs.firstIndex { $0 === finished }, to: finished.displayTitle)
         guard finished === activeTab else { return }
+        // A certificate nobody in the public PKI backs is worth one
+        // interruption per host: it is either a proxy this machine's owner
+        // installed — see it and keep working — or a page pretending to be
+        // somebody else, which is the case the warning exists for.
+        announceCertificate(for: finished.webView.url?.host)
         // A new page means new context for the question being typed about it.
         if aiSidebarShown { captureAIPageContext() }
         // The find term survives a navigation; the matches do not. Rescan on
@@ -3933,6 +3974,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
              NSURLAuthenticationMethodNTLM where launchOptions.snap == nil:
             promptForCredentials(webView: webView, challenge: challenge,
                                  completionHandler: completionHandler)
+        case NSURLAuthenticationMethodServerTrust:
+            // WebKit decides this one; the answer below is only ever the
+            // default. What the delegate buys is the look before the decision:
+            // the chain a page arrived with is the one fact a user of this app
+            // cannot otherwise see, since there is no toolbar to hang a padlock
+            // on — and on a managed machine a substituted certificate is the
+            // whole of the question.
+            TLSAudit.note(host: challenge.protectionSpace.host,
+                          trust: challenge.protectionSpace.serverTrust)
+            completionHandler(.performDefaultHandling, nil)
         default:
             completionHandler(.performDefaultHandling, nil)
         }
@@ -3992,6 +4043,28 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        // Cleartext goes first: every branch below is a decision about a load
+        // that may not be allowed to happen at all. A click is the page naming a
+        // URL the user chose to follow, so it gets asked about; a script, a
+        // redirect or a history step gets refused with the reason on screen,
+        // because no gesture is behind it. --snap passes: a one-shot screenshot
+        // of an explicit URL is already the user asking.
+        if launchOptions.snap == nil,
+           navigationAction.targetFrame?.isMainFrame != false,
+           let url = navigationAction.request.url,
+           url.scheme?.lowercased() == "http",
+           let host = url.host?.lowercased(),
+           !InsecureNavigation.isLocal(host),
+           !insecureAllowedHosts.contains(host) {
+            if navigationAction.navigationType == .linkActivated
+                || navigationAction.navigationType == .formSubmitted {
+                confirmInsecureLoad(url, from: webView)
+            } else {
+                showToast("Refused an unencrypted page: \(host)")
+            }
+            decisionHandler(.cancel)
+            return
+        }
         // The user agent is a property of the next load, not of this one —
         // crossing into or out of a spoofed host means canceling the first
         // attempt and starting it again under the right agent.
@@ -4078,6 +4151,33 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate,
             self?.isConfirmingExternalOpen = false
             guard response == .alertFirstButtonReturn else { return }
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Asks before fetching a page in the clear. One sheet at a time, and the
+    /// yes sticks to the host for the session — the question is about the site,
+    /// not about the click.
+    private func confirmInsecureLoad(_ url: URL, from webView: WKWebView) {
+        guard let window, !isConfirmingInsecureLoad,
+              let host = url.host?.lowercased() else { return }
+        isConfirmingInsecureLoad = true
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Load this page unencrypted?"
+        alert.informativeText = "This link goes to:\n\n\(url.absoluteString)\n\n"
+            + "Without TLS, everything sent to that page — a password included — crosses "
+            + "every network between this Mac and the server in readable form, and the "
+            + "page that comes back can be rewritten on the way."
+        alert.addButton(withTitle: "Load Anyway")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { return }
+            self.isConfirmingInsecureLoad = false
+            guard response == .alertFirstButtonReturn else { return }
+            self.insecureAllowedHosts.insert(host)
+            // Loaded here, not through `load`: that path upgrades to https, and
+            // the user just said the clear-text URL is the one they want.
+            webView.load(URLRequest(url: url))
         }
     }
 
